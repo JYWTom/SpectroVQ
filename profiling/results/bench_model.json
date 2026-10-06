@@ -1,0 +1,155 @@
+{
+  "params_M": {
+    "encoder": 24.66,
+    "decoder": 24.79101,
+    "codebooks": 6.303756
+  },
+  "layer_ms_per_spectrum_bs32": {
+    "enc[00] SConv1d": 0.5071799375002684,
+    "enc[01] SEANetResnetBlock": 4.571123281248646,
+    "enc[02] ELU": 0.3229885000024524,
+    "enc[03] SConv1d": 1.4040822812511067,
+    "enc[04] SEANetResnetBlock": 4.344413187499896,
+    "enc[05] ELU": 0.36635740625001745,
+    "enc[06] SConv1d": 1.3756863749989634,
+    "enc[07] SEANetResnetBlock": 1.8004444687491628,
+    "enc[08] ELU": 0.08826446875076499,
+    "enc[09] SConv1d": 0.8242573125016861,
+    "enc[10] SEANetResnetBlock": 0.4457645937492316,
+    "enc[11] ELU": 0.026153812498819207,
+    "enc[12] SConv1d": 0.37419243749781117,
+    "enc[13] Transformer": 2.948689406249372,
+    "enc[14] ELU": 0.005729874999360618,
+    "enc[15] SConv1d": 0.12030459375012015,
+    "dec[00] SConv1d": 0.1270125625012497,
+    "dec[01] Transformer": 2.7408574375016315,
+    "dec[02] ELU": 0.005748968749941241,
+    "dec[03] SConvTranspose1d": 0.375437500000686,
+    "dec[04] SEANetResnetBlock": 0.5880812187477602,
+    "dec[05] ELU": 0.02921890624918433,
+    "dec[06] SConvTranspose1d": 0.8190184062506489,
+    "dec[07] SEANetResnetBlock": 1.5053075624997803,
+    "dec[08] ELU": 0.08171653125188527,
+    "dec[09] SConvTranspose1d": 1.6001209687495077,
+    "dec[10] SEANetResnetBlock": 4.421973468748064,
+    "dec[11] ELU": 0.3338917499995375,
+    "dec[12] SConvTranspose1d": 1.3459942187488139,
+    "dec[13] SEANetResnetBlock": 4.560956562499996,
+    "dec[14] ELU": 0.3126532812522953,
+    "dec[15] SConv1d": 1.107299906252024,
+    "dec[16] Sigmoid": 0.005721000000846743
+  },
+  "op_table": "--------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  \n                            Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg    # of Calls  \n--------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  \n        aten::mkldnn_convolution        36.54%     526.016ms        36.60%     526.843ms      16.464ms            32  \n                        aten::mm        18.08%     260.225ms        18.08%     260.265ms       2.958ms            88  \n          aten::reflection_pad1d        11.48%     165.236ms        12.66%     182.186ms       5.693ms            32  \n                       aten::elu         8.47%     121.854ms         8.47%     121.854ms       4.687ms            26  \n              aten::_convolution         6.93%      99.719ms        46.17%     664.560ms      18.460ms            36  \n                         encoder         4.77%      68.623ms        45.07%     648.732ms     648.732ms             1  \n                     aten::copy_         4.39%      63.213ms         4.39%      63.213ms     325.839us           194  \n                         decoder         4.12%      59.346ms        46.09%     663.358ms     663.358ms             1  \n                       aten::add         2.72%      39.100ms         2.72%      39.190ms     559.858us            70  \n                       aten::mul         0.51%       7.329ms         0.51%       7.358ms      79.983us            92  \n                       aten::bmm         0.29%       4.223ms         0.29%       4.232ms     176.324us            24  \n    aten::_weight_norm_interface         0.24%       3.464ms         0.27%       3.918ms     108.825us            36  \n                      aten::silu         0.20%       2.831ms         0.20%       2.831ms     235.935us            12  \n                    vq.encode_q4         0.10%       1.403ms         8.84%     127.301ms     127.301ms             1  \n                       aten::pow         0.10%       1.378ms         0.10%       1.423ms      41.858us            34  \n--------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  \nSelf CPU time total: 1.439s\n",
+  "sweep": [
+    {
+      "threads": 1,
+      "batch": 1,
+      "encoder_ms_per_spec": 50.85078100000828,
+      "vq4_ms_per_spec": 16.41650600004141,
+      "decoder_ms_per_spec": 53.336114999979145
+    },
+    {
+      "threads": 1,
+      "batch": 8,
+      "encoder_ms_per_spec": 38.33867624999243,
+      "vq4_ms_per_spec": 15.708267250005292,
+      "decoder_ms_per_spec": 45.32077224999398
+    },
+    {
+      "threads": 1,
+      "batch": 32,
+      "encoder_ms_per_spec": 52.15570646874923,
+      "vq4_ms_per_spec": 15.848934312497676,
+      "decoder_ms_per_spec": 58.121382718749004
+    },
+    {
+      "threads": 1,
+      "batch": 128,
+      "encoder_ms_per_spec": 91.15225653124969,
+      "vq4_ms_per_spec": 15.37260742187474,
+      "decoder_ms_per_spec": 86.91061056249971
+    },
+    {
+      "threads": 2,
+      "batch": 1,
+      "encoder_ms_per_spec": 34.40966599998774,
+      "vq4_ms_per_spec": 11.866711000038777,
+      "decoder_ms_per_spec": 37.01119100003325
+    },
+    {
+      "threads": 2,
+      "batch": 8,
+      "encoder_ms_per_spec": 19.17869950000295,
+      "vq4_ms_per_spec": 7.55845262500543,
+      "decoder_ms_per_spec": 20.006749749995834
+    },
+    {
+      "threads": 2,
+      "batch": 32,
+      "encoder_ms_per_spec": 29.860723531250244,
+      "vq4_ms_per_spec": 8.013949875000037,
+      "decoder_ms_per_spec": 31.226344875001644
+    },
+    {
+      "threads": 2,
+      "batch": 128,
+      "encoder_ms_per_spec": 45.10266541406249,
+      "vq4_ms_per_spec": 7.913756507812231,
+      "decoder_ms_per_spec": 43.12825144531285
+    },
+    {
+      "threads": 4,
+      "batch": 1,
+      "encoder_ms_per_spec": 25.295160000041506,
+      "vq4_ms_per_spec": 7.047662999980275,
+      "decoder_ms_per_spec": 23.37367699999504
+    },
+    {
+      "threads": 4,
+      "batch": 8,
+      "encoder_ms_per_spec": 13.390382249994559,
+      "vq4_ms_per_spec": 5.490741125001364,
+      "decoder_ms_per_spec": 12.145114125004852
+    },
+    {
+      "threads": 4,
+      "batch": 32,
+      "encoder_ms_per_spec": 16.579811718749227,
+      "vq4_ms_per_spec": 4.205203843749672,
+      "decoder_ms_per_spec": 18.99038403125175
+    },
+    {
+      "threads": 4,
+      "batch": 128,
+      "encoder_ms_per_spec": 22.898475703124532,
+      "vq4_ms_per_spec": 4.294557742187344,
+      "decoder_ms_per_spec": 25.227602382813075
+    }
+  ],
+  "quantizer_sweep": [
+    {
+      "quantizers": 1,
+      "vq_encode_ms_per_spec": 3.8879571249985645,
+      "decode_ms_per_spec": 20.28800271875042,
+      "payload_bytes_per_spec": 33.75
+    },
+    {
+      "quantizers": 4,
+      "vq_encode_ms_per_spec": 4.369389281247749,
+      "decode_ms_per_spec": 18.724641406251408,
+      "payload_bytes_per_spec": 135.0
+    },
+    {
+      "quantizers": 8,
+      "vq_encode_ms_per_spec": 4.334115531250404,
+      "decode_ms_per_spec": 17.657797500000072,
+      "payload_bytes_per_spec": 270.0
+    },
+    {
+      "quantizers": 12,
+      "vq_encode_ms_per_spec": 4.691816593751952,
+      "decode_ms_per_spec": 18.87383996874803,
+      "payload_bytes_per_spec": 405.0
+    }
+  ]
+}

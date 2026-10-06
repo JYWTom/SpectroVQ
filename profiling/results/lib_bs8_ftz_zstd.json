@@ -1,0 +1,103 @@
+{
+  "config": {
+    "weights": "/home/user/weights/spectroVQ_weights.ckpt",
+    "mgf": "/home/user/data/ecoli_lib_2000.mgf",
+    "out_dir": "/home/user/prof_out/g",
+    "quantizer": 4,
+    "batch_size": 8,
+    "threads": 4,
+    "num_workers": 0,
+    "method": "zstd",
+    "level": 15,
+    "cprofile": false,
+    "json": "/home/user/prof_out/lib_bs8_ftz_zstd.json",
+    "dedupe_encode": false,
+    "flush_denormals": true
+  },
+  "torch": "2.14.1+cpu",
+  "cpu_count": 4,
+  "model_load_s": 1.2995212969999557,
+  "compress": {
+    "wall_s": 115.59787315099993,
+    "n_spectra": 2000,
+    "n_compounded": 1847,
+    "stages": {
+      "model.encoder": {
+        "seconds": 77.75522437899235,
+        "calls": 750
+      },
+      "model.decoder": {
+        "seconds": 30.847836221000307,
+        "calls": 250
+      },
+      "model.vq_encode": {
+        "seconds": 3.616072935004013,
+        "calls": 750
+      },
+      "pre.spectrum_to_vector": {
+        "seconds": 0.8747669219987984,
+        "calls": 2000
+      },
+      "io.bitpacker_flush": {
+        "seconds": 0.5279029509997599,
+        "calls": 1
+      },
+      "io.metadata_parquet_write": {
+        "seconds": 0.2674868329995661,
+        "calls": 1
+      },
+      "io.mgf_read": {
+        "seconds": 0.2634785590003048,
+        "calls": 1
+      },
+      "io.bitpacker_push": {
+        "seconds": 0.18969164811323935,
+        "calls": 415476
+      }
+    },
+    "peak_rss_mb": 1276.21875
+  },
+  "sizes": {
+    "input_mgf": 3053821,
+    "ecoli_lib_2000.vqms2": 691972,
+    "ecoli_lib_2000.parquet": 195413,
+    "ecoli_lib_2000_compounded.pkl": 5315,
+    "total_compressed": 892700,
+    "ratio": 3.4208815951607483
+  },
+  "decompress": {
+    "wall_s": 93.5478490370001,
+    "n_spectra": 2000,
+    "stages": {
+      "model.decoder": {
+        "seconds": 90.08482813899627,
+        "calls": 712
+      },
+      "post.vector_to_peaks": {
+        "seconds": 0.3955433789978997,
+        "calls": 481
+      },
+      "io.bitunpacker_pull": {
+        "seconds": 0.3672846281069724,
+        "calls": 415476
+      },
+      "model.vq_decode": {
+        "seconds": 0.3480320259977816,
+        "calls": 712
+      },
+      "io.mgf_write": {
+        "seconds": 0.22242264099986642,
+        "calls": 1
+      },
+      "post.format_mgf_records": {
+        "seconds": 0.17251351700315354,
+        "calls": 2000
+      },
+      "io.metadata_parquet_read": {
+        "seconds": 0.03557073499996477,
+        "calls": 1
+      }
+    },
+    "peak_rss_mb": 1276.21875
+  }
+}

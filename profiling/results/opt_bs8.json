@@ -1,0 +1,28 @@
+{
+  "batch_size": 8,
+  "quantizer": 4,
+  "flushed_denormals": 49664,
+  "variants": {
+    "fp32": {
+      "ms_per_spectrum": 32.54772764062608,
+      "code_agreement": 1.0,
+      "first_quantizer_agreement": 1.0,
+      "decoded_max_abs_diff": 0.0,
+      "decoded_mean_abs_diff": 0.0
+    },
+    "fp32+ftz": {
+      "ms_per_spectrum": 28.312674421872686,
+      "code_agreement": 1.0,
+      "first_quantizer_agreement": 1.0,
+      "decoded_max_abs_diff": 0.0,
+      "decoded_mean_abs_diff": 0.0
+    },
+    "bf16+ftz": {
+      "ms_per_spectrum": 36.59556351562543,
+      "code_agreement": 0.9730902777777778,
+      "first_quantizer_agreement": 0.9907407407407407,
+      "decoded_max_abs_diff": 0.04979654774069786,
+      "decoded_mean_abs_diff": 5.9092864830745384e-05
+    }
+  }
+}

@@ -1,0 +1,27 @@
+Flushed 49664 denormal codebook values
+Model load: 1.24s, threads=4
+
+=== Compression: 87.57s wall, 22.8 spectra/s, 43.78 ms/spectrum ===
+  model.encoder                   51.58s  58.9%  calls=500
+  model.decoder                   30.73s  35.1%  calls=250
+  model.vq_encode                  2.28s   2.6%  calls=500
+  pre.spectrum_to_vector           0.90s   1.0%  calls=2000
+  io.bitpacker_push                0.57s   0.6%  calls=415476
+  io.mgf_read                      0.22s   0.3%  calls=1
+  io.metadata_parquet_write        0.11s   0.1%  calls=1
+  io.bitpacker_flush               0.00s   0.0%  calls=1
+  other (unattributed)             1.17s   1.3%
+
+Sizes: input 3.05 MB -> 0.722 MB (ratio 4.2x) {'ecoli_lib_2000.vqms2': 519325, 'ecoli_lib_2000.parquet': 197082, 'ecoli_lib_2000_compounded.pkl': 5315}
+
+=== Decompression: 95.99s wall, 20.8 spectra/s, 48.00 ms/spectrum ===
+  model.decoder                   92.42s  96.3%  calls=712
+  post.vector_to_peaks             0.41s   0.4%  calls=481
+  model.vq_decode                  0.39s   0.4%  calls=712
+  io.bitunpacker_pull              0.35s   0.4%  calls=415476
+  io.mgf_write                     0.25s   0.3%  calls=1
+  post.format_mgf_records          0.19s   0.2%  calls=2000
+  io.metadata_parquet_read         0.05s   0.1%  calls=1
+  other (unattributed)             1.94s   2.0%
+
+Peak RSS: 1277 MB
