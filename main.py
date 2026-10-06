@@ -48,8 +48,8 @@ torch.backends.cudnn.benchmark=True
 SpectraStream = getModel.getModel()
 # Apply pre-trained weights to the model
 SpectraStream = getModel.ApplyWeights(SpectraStream,weights_path)
-# Move model to GPU and set to evaluation mode
-SpectraStream.to('cuda')
+# Move model to GPU if available (otherwise run on CPU) and set to evaluation mode
+SpectraStream.to('cuda' if torch.cuda.is_available() else 'cpu')
 SpectraStream.eval()
 
 level = int(compression_level) if compression_level is not None else None
