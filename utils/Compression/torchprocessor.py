@@ -44,9 +44,11 @@ class SpectrumTorchBatchEncoder():
                 self.MaxValList.extend(MaxVal.numpy().tolist())
                 inputBatch = inputBatch.to(self.device)
                 sqinputBatch = torch.square(inputBatch)
+                # Encode once; the chimeric check decodes from the same embedding instead of re-running the encoder
+                embedding, codes, _, _ = self.model.encode(inputBatch,returnCodebookIndices = True,returnAll = True,numquantizer = quantizer)
                 if self.compounded:
                     # Process the output spectra
-                    output_spectra, _,_ = self.model.forwardWithnumQuantizers(inputBatch,quantizer)
+                    output_spectra = self.model.decodeLatent(embedding)
                     output_spectra = rescaleSpectra(output_spectra,dim = 2)
                     output_spectra = torch.square(output_spectra)
                     output_spectra = torch.where(output_spectra < 1e-3,torch.zeros_like(output_spectra),output_spectra)
@@ -59,7 +61,6 @@ class SpectrumTorchBatchEncoder():
                         if NumberOfPeaksPortion[i] < 0.5:
                             self.compoundedCodes.append(ChimericCodes[:,i,:])
                             self.compoundedCodesIdx.append(i + (batchidx * batch_size))
-                _, codes, _, _ = self.model.encode(inputBatch,returnCodebookIndices = True,returnAll = True,numquantizer = quantizer)
                 CodeList.append(codes.cpu())
 
                 if outputOutOfRange:
