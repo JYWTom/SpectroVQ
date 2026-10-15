@@ -301,7 +301,7 @@ class LightningModelSpectraStream(L.LightningModule):
     
     def configure_optimizers(self):
         warmup_epochs = 7
-        total_epochs = 50
+        total_epochs = num_epochs
         optimizer = AdamW(self.model.parameters(), lr=self.learning_rate)
         num_train_optimization_steps = total_epochs * self.len_train_loader
         num_warmup_steps = warmup_epochs * self.len_train_loader
@@ -328,11 +328,11 @@ model_kwargs2 = {'inputChannel': 1, 'n_q':12, 'n_filters': 32,'n_residual_layers
             'residual_kernel_size': 6,'codebook_size':1024, 'FiLMEncoder' : False, 'FiLMDecoder' :False,'flattenQuantization' : False,
             'quantizationdim': 256, 'biLSTM': False,'causal':False,'useQINCo':False,'inputSize' : 13500,'dimension':256,'kernel_size':8, 
             'encoders':False,'bucketTransform':False,'applyquantizerdroput':True,'transformer':6}
-num_epochs = 50
+num_epochs = args.max_epochs
 SpectraStream = modelStream.SpectroVQ(**model_kwargs2)
 # %%
-learning_rate = 1e-4
-batch_size = 32
+learning_rate = args.learning_rate
+batch_size = args.batch_size
 torch.cuda.empty_cache()
 # %%
 print('Preprocessing Training Data')
@@ -340,13 +340,13 @@ traindata,testdata = PreprocessData()
 # %%
 print('Creating Training Data Loaders')
 spectraTrainData = SpectrumBatch(traindata)
-train_loader = DataLoader(spectraTrainData, batch_size=batch_size, shuffle=True,num_workers=28,drop_last=True,pin_memory=True, prefetch_factor = 24)
+train_loader = DataLoader(spectraTrainData, batch_size=batch_size, shuffle=True,num_workers=args.num_workers,drop_last=True,pin_memory=True, prefetch_factor = 24 if args.num_workers > 0 else None)
 spectraTestData = SpectrumBatch(testdata)
-test_loader = DataLoader(spectraTestData, batch_size=batch_size, shuffle=False,num_workers=28,drop_last=True,pin_memory = True, prefetch_factor = 24)
+test_loader = DataLoader(spectraTestData, batch_size=batch_size, shuffle=False,num_workers=args.num_workers,drop_last=True,pin_memory = True, prefetch_factor = 24 if args.num_workers > 0 else None)
 LightningTrainer = LightningModelSpectraStream(SpectraStream,learning_rate=learning_rate,len_train_loader = len(train_loader),len_test_loader = len(test_loader))
 checkpoint_callback = ModelCheckpoint(dirpath=output_dir,monitor = 'val_mean_loss',filename='SpectroVQ-{epoch:02d}-{val_loss:.2f}',save_top_k=3,mode='min') 
 early_stop_callback = EarlyStopping(monitor="val_mean_loss", min_delta=0.005, patience=4, verbose=True, mode="min",check_on_train_epoch_end = False)
-trainer = L.Trainer(max_epochs = num_epochs, log_every_n_steps = 1, check_val_every_n_epoch = 3, callbacks=[early_stop_callback,checkpoint_callback],accelerator="gpu", devices=1, num_nodes=1, strategy="auto",gradient_clip_val=1)
+trainer = L.Trainer(max_epochs = num_epochs, log_every_n_steps = 1, check_val_every_n_epoch = 3, callbacks=[early_stop_callback,checkpoint_callback],accelerator="auto", devices=1, num_nodes=1, strategy="auto",gradient_clip_val=1)
 trainer.fit(LightningTrainer,train_dataloaders = train_loader,val_dataloaders = test_loader)
 
 # %%
