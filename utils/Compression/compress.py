@@ -170,6 +170,8 @@ class BitPacker:
         self._current_value = 0
         self._current_bits = 0
         self.bits = bits
+        # The underlying file; closing the gzip/zlib wrapper in flush() leaves it open.
+        self._raw_fo = fo
 
         # Count compression methods specified
         compression_methods = sum(
