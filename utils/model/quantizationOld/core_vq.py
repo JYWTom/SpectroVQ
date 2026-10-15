@@ -39,8 +39,9 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-#from .. import distrib
+# from .. import distrib
 from . import distrib
+
 
 def default(val: tp.Any, d: tp.Any) -> tp.Any:
     return val if val is not None else d
@@ -77,10 +78,8 @@ def kmeans(samples, num_clusters: int, num_iters: int = 10):
     means = sample_vectors(samples, num_clusters)
 
     for _ in range(num_iters):
-        diffs = rearrange(samples, "n d -> n () d") - rearrange(
-            means, "c d -> () c d"
-        )
-        dists = -(diffs ** 2).sum(dim=-1)
+        diffs = rearrange(samples, "n d -> n () d") - rearrange(means, "c d -> () c d")
+        dists = -(diffs**2).sum(dim=-1)
 
         buckets = dists.max(dim=-1).indices
         bins = torch.bincount(buckets, minlength=num_clusters)
@@ -111,6 +110,7 @@ class EuclideanCodebook(nn.Module):
             that have an exponential moving average cluster size less than the specified threshold with
             randomly selected vector from the current batch.
     """
+
     def __init__(
         self,
         dim: int,
@@ -123,7 +123,9 @@ class EuclideanCodebook(nn.Module):
     ):
         super().__init__()
         self.decay = decay
-        init_fn: tp.Union[tp.Callable[..., torch.Tensor], tp.Any] = uniform_init if not kmeans_init else torch.zeros
+        init_fn: tp.Union[tp.Callable[..., torch.Tensor], tp.Any] = (
+            uniform_init if not kmeans_init else torch.zeros
+        )
         embed = init_fn(codebook_size, dim)
 
         self.codebook_size = codebook_size
@@ -247,6 +249,7 @@ class VectorQuantization(nn.Module):
             randomly selected vector from the current batch.
         commitment_weight (float): Weight for commitment loss.
     """
+
     def __init__(
         self,
         dim: int,
@@ -257,22 +260,31 @@ class VectorQuantization(nn.Module):
         kmeans_init: bool = True,
         kmeans_iters: int = 50,
         threshold_ema_dead_code: int = 2,
-        commitment_weight: float = 1.,
+        commitment_weight: float = 1.0,
     ):
         super().__init__()
         _codebook_dim: int = default(codebook_dim, dim)
 
         requires_projection = _codebook_dim != dim
-        self.project_in = (nn.Linear(dim, _codebook_dim) if requires_projection else nn.Identity())
-        self.project_out = (nn.Linear(_codebook_dim, dim) if requires_projection else nn.Identity())
+        self.project_in = (
+            nn.Linear(dim, _codebook_dim) if requires_projection else nn.Identity()
+        )
+        self.project_out = (
+            nn.Linear(_codebook_dim, dim) if requires_projection else nn.Identity()
+        )
 
         self.epsilon = epsilon
         self.commitment_weight = commitment_weight
 
-        self._codebook = EuclideanCodebook(dim=_codebook_dim, codebook_size=codebook_size,
-                                           kmeans_init=kmeans_init, kmeans_iters=kmeans_iters,
-                                           decay=decay, epsilon=epsilon,
-                                           threshold_ema_dead_code=threshold_ema_dead_code)
+        self._codebook = EuclideanCodebook(
+            dim=_codebook_dim,
+            codebook_size=codebook_size,
+            kmeans_init=kmeans_init,
+            kmeans_iters=kmeans_iters,
+            decay=decay,
+            epsilon=epsilon,
+            threshold_ema_dead_code=threshold_ema_dead_code,
+        )
         self.codebook_size = codebook_size
 
     @property
@@ -295,7 +307,7 @@ class VectorQuantization(nn.Module):
         x = rearrange(x, "b d n -> b n d")
         x = self.project_in(x)
         quantize, embed_in = self._codebook(x)
-        loss = F.mse_loss(quantize.detach(), x, reduction='none')
+        loss = F.mse_loss(quantize.detach(), x, reduction="none")
         loss = loss.sum(dim=-1)
         quantize = self.project_out(quantize)
         quantize = rearrange(quantize, "b n d -> b d n")
@@ -314,9 +326,11 @@ class VectorQuantization(nn.Module):
         loss = torch.tensor([0.0], device=device, requires_grad=self.training)
 
         if self.training:
-            warnings.warn('When using RVQ in training model, first check '
-                          'https://github.com/facebookresearch/encodec/issues/25 . '
-                          'The bug wasn\'t fixed here for reproducibility.')
+            warnings.warn(
+                "When using RVQ in training model, first check "
+                "https://github.com/facebookresearch/encodec/issues/25 . "
+                "The bug wasn't fixed here for reproducibility."
+            )
             if self.commitment_weight > 0:
                 commit_loss = F.mse_loss(quantize.detach(), x)
                 loss = loss + commit_loss * self.commitment_weight
@@ -330,7 +344,8 @@ class ResidualVectorQuantization(nn.Module):
     """Residual vector quantization implementation.
     Follows Algorithm 1. in https://arxiv.org/pdf/2107.03312.pdf
     """
-    def __init__(self, *, num_quantizers, l2norm,**kwargs):
+
+    def __init__(self, *, num_quantizers, l2norm, **kwargs):
         super().__init__()
         self.layers = nn.ModuleList(
             [VectorQuantization(**kwargs) for _ in range(num_quantizers)]
@@ -347,11 +362,13 @@ class ResidualVectorQuantization(nn.Module):
         n_q = n_q or len(self.layers)
 
         for layer in self.layers[:n_q]:
-            #Modified with L2 Norm from https://arxiv.org/abs/2306.06546
+            # Modified with L2 Norm from https://arxiv.org/abs/2306.06546
             if self.l2norm:
                 residual = nn.functional.normalize(residual, p=2, dim=1)
             quantized, indices, loss = layer(residual)
-            residual = residual - quantized.detach() # issue suggested in https://github.com/facebookresearch/encodec/issues/25
+            residual = (
+                residual - quantized.detach()
+            )  # issue suggested in https://github.com/facebookresearch/encodec/issues/25
             quantized_out = quantized_out + quantized
 
             all_indices.append(indices)
@@ -365,8 +382,8 @@ class ResidualVectorQuantization(nn.Module):
         all_indices = []
         n_q = n_q or len(self.layers)
         for layer in self.layers[:n_q]:
-            #Modified with L2 Norm from https://arxiv.org/abs/2306.06546
-            #residual = nn.functional.normalize(residual, p=2, dim=1)
+            # Modified with L2 Norm from https://arxiv.org/abs/2306.06546
+            # residual = nn.functional.normalize(residual, p=2, dim=1)
             indices = layer.encode(residual)
             quantized = layer.decode(indices)
             residual = residual - quantized
@@ -392,11 +409,13 @@ class ResidualVectorQuantization(nn.Module):
         n_q = n_q or len(self.layers)
 
         for layer in self.layers[:n_q]:
-            #Modified with L2 Norm from https://arxiv.org/abs/2306.06546
+            # Modified with L2 Norm from https://arxiv.org/abs/2306.06546
             if self.l2norm:
                 residual = nn.functional.normalize(residual, p=2, dim=1)
             quantized, indices, loss = layer.encodeWithLoss(residual)
-            residual = residual - quantized.detach() # issue suggested in https://github.com/facebookresearch/encodec/issues/25
+            residual = (
+                residual - quantized.detach()
+            )  # issue suggested in https://github.com/facebookresearch/encodec/issues/25
             quantized_out = quantized_out + quantized
 
             all_indices.append(indices)

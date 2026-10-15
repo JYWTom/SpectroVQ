@@ -23,7 +23,7 @@ class ModelArgs:
     ffn_dim_multiplier: Optional[float] = None
     norm_eps: float = 1e-5
 
-    #max_batch_size: int = 32
+    # max_batch_size: int = 32
     max_seq_len: int = 2048
 
 
@@ -89,8 +89,8 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     Returns:
         torch.Tensor: Precomputed frequency tensor with complex exponentials.
 
-    
-        
+
+
 
     """
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
@@ -146,7 +146,7 @@ def apply_rotary_emb(
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: Tuple of modified query tensor and key tensor with rotary embeddings.
 
-        
+
 
     """
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
@@ -171,6 +171,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 class Attention(nn.Module):
     """Multi-head attention module."""
+
     def __init__(self, args: ModelArgs):
         """
         Initialize the Attention module.
@@ -194,54 +195,38 @@ class Attention(nn.Module):
         """
         super().__init__()
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
-        self.n_local_heads = args.n_heads 
-        self.n_local_kv_heads = self.n_kv_heads 
+        self.n_local_heads = args.n_heads
+        self.n_local_kv_heads = self.n_kv_heads
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
-        
-        self.wq = nn.Linear(
-            args.dim,
-            args.n_heads * self.head_dim,
-            bias=False
-        )
-        self.wk = nn.Linear(
-            args.dim,
-            self.n_kv_heads * self.head_dim,
-            bias=False
-        )
-        self.wv = nn.Linear(
-            args.dim,
-            self.n_kv_heads * self.head_dim,
-            bias=False
-        )
-        self.wo = nn.Linear(
-            args.n_heads * self.head_dim,
-            args.dim,
-            bias=False
-        )
+
+        self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
+        self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
 
         # self.cache_k = torch.zeros(
-            
+
         #         args.max_batch_size,
         #         args.max_seq_len,
         #         self.n_local_kv_heads,
         #         self.head_dim,
-            
+
         # ).cuda()
         # self.cache_v = torch.zeros(
-            
+
         #         args.max_batch_size,
         #         args.max_seq_len,
         #         self.n_local_kv_heads,
         #         self.head_dim,
         #         self.device,
-            
+
         # ).cuda()
 
     def forward(
         self,
         x: torch.Tensor,
-        #start_pos: int,
+        # start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
     ):
@@ -280,12 +265,18 @@ class Attention(nn.Module):
         values = xv
 
         # repeat k/v heads if n_kv_heads < n_heads
-        keys = repeat_kv(keys, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
-        values = repeat_kv(values, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+        keys = repeat_kv(
+            keys, self.n_rep
+        )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+        values = repeat_kv(
+            values, self.n_rep
+        )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
 
         xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        keys = keys.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
-        values = values.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        values = values.transpose(
+            1, 2
+        )  # (bs, n_local_heads, cache_len + seqlen, head_dim)
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
         if mask is not None:
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
@@ -370,7 +361,7 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        #start_pos: int,
+        # start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
     ):
@@ -387,11 +378,10 @@ class TransformerBlock(nn.Module):
             torch.Tensor: Output tensor after applying attention and feedforward layers.
 
         """
-        h = x + self.attention(
-            self.attention_norm(x), freqs_cis, mask
-        )
+        h = x + self.attention(self.attention_norm(x), freqs_cis, mask)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
+
 
 class Transformer(nn.Module):
     def __init__(self, params: ModelArgs):
@@ -431,12 +421,12 @@ class Transformer(nn.Module):
         # )
 
         self.freqs_cis = precompute_freqs_cis(
-            # Note that self.params.max_seq_len is multiplied by 2 because the token limit for the Llama 2 generation of models is 4096. 
+            # Note that self.params.max_seq_len is multiplied by 2 because the token limit for the Llama 2 generation of models is 4096.
             # Adding this multiplier instead of using 4096 directly allows for dynamism of token lengths while training or fine-tuning.
-            self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
+            self.params.dim // self.params.n_heads,
+            self.params.max_seq_len * 2,
         )
 
-    
     def forward(self, tokens: torch.Tensor):
         """
         Perform a forward pass through the Transformer model.
@@ -449,12 +439,12 @@ class Transformer(nn.Module):
             torch.Tensor: Output logits after applying the Transformer model.
 
         """
-        #Convolution Output (B,Dim,Len) -> Transformer input (B,Dim,Len)
-        tokens = tokens.permute(0,2,1)
-        _bsz,seqlen,channel = tokens.shape
+        # Convolution Output (B,Dim,Len) -> Transformer input (B,Dim,Len)
+        tokens = tokens.permute(0, 2, 1)
+        _bsz, seqlen, channel = tokens.shape
         # h = self.tok_embeddings(tokens)
         self.freqs_cis = self.freqs_cis.to(tokens.device)
-        freqs_cis = self.freqs_cis[ : seqlen]
+        freqs_cis = self.freqs_cis[:seqlen]
         h = tokens
         # mask = None
         # if seqlen > 1:
@@ -473,14 +463,15 @@ class Transformer(nn.Module):
         #         mask
         #     ]).type_as(h)
         for layer in self.layers:
-            h = layer(h, freqs_cis,None)
+            h = layer(h, freqs_cis, None)
         h = self.norm(h)
-        #output = self.output(h).float()
-        #Transformer input (B,Dim,Len) - >Convolution Output (B,Dim,Len)
-        h = h.permute(0,2,1)
+        # output = self.output(h).float()
+        # Transformer input (B,Dim,Len) - >Convolution Output (B,Dim,Len)
+        h = h.permute(0, 2, 1)
         return h
-    
-if __name__ == '__main__':
+
+
+if __name__ == "__main__":
     model = Transformer(ModelArgs())
     x = torch.randn(2, 128, 2048)
     y = model(x)
