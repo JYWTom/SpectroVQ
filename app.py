@@ -10,7 +10,8 @@ Tabs:
 
 The GUI is a remote front end for the machine it runs on (e.g. a GPU server): every input is a
 path on that machine, picked by typing it or with the "Browse ..." file browser, and outputs are
-written there too (under gui_outputs/). Nothing is uploaded from the browser.
+written to an export path on that machine (default: the run's gui_outputs/ folder). Nothing is
+uploaded from or downloaded to the browser.
 
 Run on the server, then reach it e.g. through an SSH tunnel (ssh -L 7860:localhost:7860 server):
     python app.py [--host 127.0.0.1] [--port 7860] [--root /data] [--ckpt model.ckpt]
@@ -19,6 +20,7 @@ Run on the server, then reach it e.g. through an SSH tunnel (ssh -L 7860:localho
 import argparse
 import contextlib
 import io
+import json
 import os
 import re
 import signal
@@ -94,6 +96,45 @@ def resolve_device(device):
 _MODEL_CACHE = {}
 _MODEL_LOCK = threading.Lock()
 
+# Server-side GUI settings that outlive restarts: the last model that loaded successfully.
+CONFIG_PATH = ROOT / "gui_config.json"
+
+
+def read_config():
+    try:
+        return json.loads(CONFIG_PATH.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(**updates):
+    config = read_config()
+    if all(config.get(k) == v for k, v in updates.items()):
+        return
+    config.update(updates)
+    tmp = CONFIG_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(config, indent=2))
+    os.replace(tmp, CONFIG_PATH)  # atomic, so a crash never leaves half a file
+
+
+def initial_ckpt():
+    """Checkpoint shown when a page opens: --ckpt wins, else the last one that loaded."""
+    return os.environ.get("SPECTROVQ_CKPT") or read_config().get("ckpt", "")
+
+
+def initial_yaml():
+    return read_config().get("yaml", "")
+
+
+def initial_model_status():
+    ckpt = initial_ckpt()
+    if not ckpt:
+        return "_No model loaded yet. It is loaded automatically on first use._"
+    source = "from --ckpt" if os.environ.get("SPECTROVQ_CKPT") else "last used"
+    return (
+        f"_Checkpoint ({source}): `{ckpt}`. It is loaded automatically on first use._"
+    )
+
 
 def load_model(ckpt_path, yaml_path, device):
     ckpt_path = os.path.expanduser((ckpt_path or "").strip())
@@ -113,6 +154,10 @@ def load_model(ckpt_path, yaml_path, device):
             model.to(device)
             model.eval()
             _MODEL_CACHE[key] = model
+            save_config(
+                ckpt=os.path.abspath(ckpt_path),
+                yaml=os.path.abspath(yaml_path) if yaml_path else "",
+            )
         return _MODEL_CACHE[key]
 
 
@@ -136,13 +181,105 @@ def model_status(ckpt_path, yaml_path, device):
 # ---------------------------------------------------------------------------
 
 
-def new_job_dir(prefix):
+# Every run gets a gui_outputs/<YYYYmmdd-HHMMSS>_<kind>_<random>/ folder ("session") holding its
+# outputs, a job.json record (kind, settings, status, outputs) and its log (job.log).
+JOB_FILE = "job.json"
+JOB_LOG = "job.log"
+_JOB_NAME = re.compile(r"^(\d{8}-\d{6})_([a-z]+)_")
+# Sessions still running in this process -> their live log buffer (None until it starts).
+_ACTIVE_JOBS = {}
+
+
+def _now():
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def read_job(job):
+    try:
+        return json.loads((Path(job) / JOB_FILE).read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def write_job(job, meta):
+    (Path(job) / JOB_FILE).write_text(json.dumps(meta, indent=2))
+
+
+def new_job_dir(prefix, **params):
     OUTPUT_ROOT.mkdir(exist_ok=True)
-    return Path(
+    job = Path(
         tempfile.mkdtemp(
             prefix=f"{datetime.now():%Y%m%d-%H%M%S}_{prefix}_", dir=OUTPUT_ROOT
         )
     )
+    write_job(
+        job,
+        {
+            "kind": prefix,
+            "status": "running",
+            "started": _now(),
+            "pid": os.getpid(),  # lets other app instances tell running from interrupted
+            "params": params,
+        },
+    )
+    _ACTIVE_JOBS[str(job)] = None
+    return job
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (TypeError, OSError):
+        return False
+    return True
+
+
+def job_running(job, meta):
+    """Whether a session is still running, in this app process or another one."""
+    if meta.get("status") != "running":
+        return False
+    return str(job) in _ACTIVE_JOBS or (
+        meta.get("pid") not in (None, os.getpid()) and _pid_alive(meta["pid"])
+    )
+
+
+def mirror_log(job, buf, alive, every=2.0):
+    """Copy a running session's log to job.log every few seconds, so any app instance (or a
+    reloaded page) can follow it."""
+
+    def run():
+        last = None
+        while alive():
+            text = buf.get()
+            if text != last:
+                with contextlib.suppress(OSError):
+                    (Path(job) / JOB_LOG).write_text(text)
+                last = text
+            time.sleep(every)
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+def finish_job(job, outputs=None, error=None, log=""):
+    """Record a session's outcome: status, finish time, output paths, error and log."""
+    if isinstance(outputs, (str, os.PathLike)):
+        outputs = [outputs]
+    meta = read_job(job)
+    meta.update(
+        status="failed" if error else "done",
+        finished=_now(),
+        outputs=[str(p) for p in outputs or []],
+    )
+    if error:
+        meta["error"] = str(error)
+    write_job(job, meta)
+    if log:
+        (Path(job) / JOB_LOG).write_text(log)
+    _ACTIVE_JOBS.pop(str(job), None)
 
 
 def host_path(path, what="file"):
@@ -153,6 +290,36 @@ def host_path(path, what="file"):
     if not os.path.isfile(path):
         raise gr.Error(f"Not found on the server: {path}")
     return os.path.abspath(path)
+
+
+def export_path(text, job, default_name):
+    """Resolve an export path typed in the GUI, refusing to overwrite existing files.
+
+    Empty text means default_name inside the run's job folder; an existing folder (or text ending
+    in '/') gets default_name inside it. Missing parent folders are created.
+    """
+    text = os.path.expanduser((text or "").strip())
+    if not text:
+        return str(Path(job) / default_name)
+    path = os.path.abspath(text)
+    if os.path.isdir(path) or text.endswith(os.sep):
+        path = os.path.join(path, default_name)
+    if os.path.exists(path):
+        raise gr.Error(f"Already exists on the server, not overwriting: {path}")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    return path
+
+
+def export_dir(text):
+    """Resolve an export folder typed in the GUI (None if empty), creating it if needed."""
+    text = os.path.expanduser((text or "").strip())
+    if not text:
+        return None
+    path = Path(text).resolve()
+    if path.exists() and not path.is_dir():
+        raise gr.Error(f"Not a folder on the server: {path}")
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def browse_folder(text):
@@ -179,8 +346,10 @@ def host_file_picker(label, pattern, placeholder="", value=""):
 
     Returns (textbox, on_pick); on_pick(fn, outputs) also runs fn(path) after a file is picked.
     """
-    start = browse_folder(value)
-    with gr.Accordion(f"Browse {label}", open=False):
+    # value may be a function, re-run on every page load (it fills the box without firing
+    # .change); the explorer starts from its value at startup.
+    start = browse_folder(value() if callable(value) else value)
+    with gr.Accordion(f"Browse {label}", open=False) as panel:
         folder = gr.State(start)
         with gr.Row():
             up = gr.Button("⬆ ..", size="sm", scale=0, min_width=64)
@@ -210,6 +379,13 @@ def host_file_picker(label, pattern, placeholder="", value=""):
     # Backspace and paste. Unqueued so a running job can't hold up browsing.
     browse = {"queue": False, "show_progress": "hidden"}
     box.change(follow_typing, [box, explorer, folder], [folder, explorer], **browse)
+    # Show a path filled in from elsewhere (e.g. the sessions sidebar).
+    box.change(
+        lambda text: gr.Accordion(open=True) if text else gr.skip(),
+        box,
+        panel,
+        **browse,
+    )
     up.click(os.path.dirname, folder, box, **browse)  # box.change then re-roots
     picked = explorer.change(lambda p: p or gr.skip(), explorer, box, **browse)
 
@@ -263,9 +439,15 @@ class _LogBuffer(io.TextIOBase):
 _JOB_LOCK = threading.Lock()
 
 
-def run_logged(fn):
-    """Run fn() in a thread, yielding (done, log_text, result, error) while it runs."""
+def run_logged(fn, job=None):
+    """Run fn() in a thread, yielding (done, log_text, result, error) while it runs.
+
+    With a session folder (job), its outcome is recorded from the thread itself, so it is
+    saved even if the browser disconnects mid-run.
+    """
     buf = _LogBuffer()
+    if job is not None:
+        _ACTIVE_JOBS[str(job)] = buf  # lets the sessions sidebar re-attach to the run
     state = {"result": None, "error": None}
 
     def target():
@@ -279,9 +461,13 @@ def run_logged(fn):
             except Exception as e:  # noqa: BLE001
                 traceback.print_exc()
                 state["error"] = e
+        if job is not None:
+            finish_job(job, state["result"], state["error"], buf.get())
 
     t = threading.Thread(target=target, daemon=True)
     t.start()
+    if job is not None:
+        mirror_log(job, buf, t.is_alive)
     while t.is_alive():
         time.sleep(0.5)
         yield False, buf.get(), None, None
@@ -475,11 +661,23 @@ def explore_run(mgf_path, idx, n_q, ckpt, yaml_path, device):
 # ---------------------------------------------------------------------------
 
 
-def denoise_run(mgf_file, n_q, retain, threshold, compounded, ckpt, yaml_path, device):
+def denoise_run(
+    mgf_file, out_file, n_q, retain, threshold, compounded, ckpt, yaml_path, device
+):
     in_path = host_path(mgf_file, "MGF file")
     model = load_model(ckpt, yaml_path, device)
-    job = new_job_dir("denoise")
-    out_path = str(job / f"{Path(in_path).stem}_denoised.mgf")
+    default_name = f"{Path(in_path).stem}_denoised.mgf"
+    if (out_file or "").strip():
+        export_path(out_file, None, default_name)  # fail before creating a session
+    job = new_job_dir(
+        "denoise",
+        input=in_path,
+        quantizers=int(n_q),
+        retain_original_peaks=retain,
+        one_percent_threshold=threshold,
+        compounded_spectra=compounded,
+    )
+    out_path = export_path(out_file, job, default_name)
 
     def work():
         print(f"Input:  {in_path}\nOutput: {out_path}\nQuantizers: {int(n_q)}")
@@ -492,13 +690,13 @@ def denoise_run(mgf_file, n_q, retain, threshold, compounded, ckpt, yaml_path, d
         )
         return out_path
 
-    yield "", None, gr.update(), None, None
-    for done, log, result, err in run_logged(work):
+    yield "", gr.update(), None, None
+    for done, log, result, err in run_logged(work, job):
         if not done:
-            yield log, None, gr.update(), None, None
+            yield log, gr.update(), None, None
             continue
         if err is not None:
-            yield log + f"\n❌ {err}", None, gr.update(), None, None
+            yield log + f"\n❌ {err}", gr.update(), None, None
             return
         n_in, n_out = count_spectra(in_path), count_spectra(result)
         log += (
@@ -508,7 +706,6 @@ def denoise_run(mgf_file, n_q, retain, threshold, compounded, ckpt, yaml_path, d
         )
         yield (
             log,
-            result,
             gr.update(minimum=0, maximum=max(n_in - 1, 1), value=0, step=1),
             in_path,
             result,
@@ -548,11 +745,28 @@ def _levels(method, level):
     }
 
 
-def compress_run(mgf_file, n_q, method, level, batch_size, ckpt, yaml_path, device):
+def compress_run(
+    mgf_file, out_dir, n_q, method, level, batch_size, ckpt, yaml_path, device
+):
     in_path = host_path(mgf_file, "MGF file")
     model = load_model(ckpt, yaml_path, device)
-    job = new_job_dir("compress")
-    stem = str(job / Path(in_path).stem)
+    out_dir = export_dir(out_dir)
+    if out_dir is not None:
+        for ext in (".vqms2", ".parquet", "_compounded.pkl"):
+            existing = out_dir / (Path(in_path).stem + ext)
+            if existing.exists():
+                raise gr.Error(
+                    f"Already exists on the server, not overwriting: {existing}"
+                )
+    job = new_job_dir(
+        "compress",
+        input=in_path,
+        quantizers=int(n_q),
+        method=method,
+        level=int(level),
+        batch_size=int(batch_size),
+    )
+    stem = str((out_dir or job) / Path(in_path).stem)
 
     def work():
         print(
@@ -574,32 +788,42 @@ def compress_run(mgf_file, n_q, method, level, batch_size, ckpt, yaml_path, devi
             if os.path.exists(p)
         ]
 
-    yield "", None, ""
-    for done, log, result, err in run_logged(work):
+    yield "", ""
+    for done, log, result, err in run_logged(work, job):
         if not done:
-            yield log, None, ""
+            yield log, ""
             continue
         if err is not None:
-            yield log + f"\n❌ {err}", None, ""
+            yield log + f"\n❌ {err}", ""
             return
         original = os.path.getsize(in_path)
         total = sum(os.path.getsize(p) for p in result)
+        # Same "name · size" list style as the sessions sidebar.
         rows = "\n".join(
-            f"| `{Path(p).name}` | {human_size(os.path.getsize(p))} |" for p in result
+            f"- `{Path(p).name}` · {human_size(os.path.getsize(p))}" for p in result
         )
         summary = (
-            f"| File | Size |\n|---|---|\n| original `{Path(in_path).name}` | {human_size(original)} |\n"
-            f"{rows}\n| **total compressed** | **{human_size(total)}** "
-            f"(ratio **{original / max(total, 1):.1f}×**) |\n\n"
+            f"**Original**\n- `{Path(in_path).name}` · {human_size(original)}\n\n"
+            f"**Compressed**\n{rows}\n- **total** · **{human_size(total)}** "
+            f"(ratio **{original / max(total, 1):.1f}×**)\n\n"
             f"Decompress with **{int(n_q)} quantizers, {method}, level {int(level)}** — "
             f"the bitstream has no header, so these must match. Keep all files together.\n\n"
-            f"Saved on the server in `{job}`."
+            f"Saved on the server in `{out_dir or job}`."
         )
-        yield log + "\n✅ Done.", result, summary
+        yield log + "\n✅ Done.", summary
 
 
 def decompress_run(
-    vq_file, n_q, method, level, batch_size, stored_raw, ckpt, yaml_path, device
+    vq_file,
+    out_file,
+    n_q,
+    method,
+    level,
+    batch_size,
+    stored_raw,
+    ckpt,
+    yaml_path,
+    device,
 ):
     vq = host_path(vq_file, ".vqms2 file")
     if not vq.endswith(".vqms2"):
@@ -609,8 +833,19 @@ def decompress_run(
     if not os.path.exists(base + ".parquet"):
         raise gr.Error(f"Metadata file not found next to it: {base}.parquet")
     model = load_model(ckpt, yaml_path, device)
-    job = new_job_dir("decompress")
-    out_path = str(job / f"{Path(vq).stem}_decompressed.mgf")
+    default_name = f"{Path(vq).stem}_decompressed.mgf"
+    if (out_file or "").strip():
+        export_path(out_file, None, default_name)  # fail before creating a session
+    job = new_job_dir(
+        "decompress",
+        input=vq,
+        quantizers=int(n_q),
+        method=method,
+        level=int(level),
+        batch_size=int(batch_size),
+        stored_raw=stored_raw,
+    )
+    out_path = export_path(out_file, job, default_name)
 
     def work():
         print(
@@ -633,10 +868,10 @@ def decompress_run(
         ).DecompressAll(verbose=1)
         return out_path
 
-    yield "", None
-    for done, log, result, err in run_logged(work):
+    yield ""
+    for done, log, result, err in run_logged(work, job):
         if not done:
-            yield log, None
+            yield log
             continue
         if err is not None:
             yield (
@@ -644,14 +879,12 @@ def decompress_run(
                 + (
                     f"\n❌ {err}\n\nIf this is a decoding error, check that the quantizer count, method "
                     f"and level match the ones used for compression."
-                ),
-                None,
+                )
             )
             return
         yield (
             log
-            + f"\n✅ Done. {count_spectra(result)} spectra written.\nSaved on the server: {result}",
-            result,
+            + f"\n✅ Done. {count_spectra(result)} spectra written.\nSaved on the server: {result}"
         )
 
 
@@ -670,9 +903,20 @@ def train_run(data_path, output_dir, batch_size, lr, max_epochs, num_workers):
     if not data_path or not os.path.exists(data_path):
         raise gr.Error(f"Training library not found: {data_path!r}")
     data_path = os.path.abspath(data_path)
+    params = {
+        "input": data_path,
+        "batch_size": int(batch_size),
+        "learning_rate": lr,
+        "max_epochs": int(max_epochs),
+        "num_workers": int(num_workers),
+    }
+    # The session folder holds the record and log; checkpoints go there too unless an
+    # output directory is given.
+    job = new_job_dir("train", **params)
     output_dir = os.path.abspath(
-        os.path.expanduser((output_dir or "").strip()) or str(new_job_dir("train"))
+        os.path.expanduser((output_dir or "").strip()) or str(job)
     )
+    write_job(job, {**read_job(job), "params": {**params, "output_dir": output_dir}})
     os.makedirs(output_dir, exist_ok=True)
     cmd = [
         sys.executable,
@@ -703,7 +947,9 @@ def train_run(data_path, output_dir, batch_size, lr, max_epochs, num_workers):
     )
     _TRAIN["proc"] = proc
     buf = _LogBuffer()
+    _ACTIVE_JOBS[str(job)] = buf
     buf.write("$ " + " ".join(cmd) + "\n")
+    mirror_log(job, buf, lambda: proc.poll() is None)
 
     def pump():
         for line in proc.stdout:
@@ -727,6 +973,12 @@ def train_run(data_path, output_dir, batch_size, lr, max_epochs, num_workers):
         else f"❌ Exited with code {proc.returncode}"
     )
     listing = "\n".join(f"- `{c}`" for c in ckpts) or "_No checkpoints written._"
+    finish_job(
+        job,
+        ckpts,
+        None if proc.returncode == 0 else f"Exited with code {proc.returncode}",
+        buf.get(),
+    )
     yield buf.get() + f"\n{status}", f"**Checkpoints in `{output_dir}`:**\n\n{listing}"
 
 
@@ -739,12 +991,163 @@ def train_stop():
 
 
 # ---------------------------------------------------------------------------
+# Sessions sidebar
+# ---------------------------------------------------------------------------
+
+SESSION_HEADERS = ["When", "Job", "Status"]
+STATUS_LABELS = {
+    "running": "⏳ running",
+    "done": "✅ done",
+    "failed": "❌ failed",
+    "interrupted": "⚠️ interrupted",
+    "empty": "⚠️ empty",
+    "unknown": "– no record",
+}
+
+
+def session_status(job, meta):
+    status = meta.get("status")
+    if status == "running" and not job_running(job, meta):
+        return "interrupted"  # the app stopped before the run finished
+    if status:
+        return status
+    # Sessions from before job.json existed: all-empty files mean the run never finished.
+    files = [p for p in Path(job).iterdir() if p.is_file()]
+    return "empty" if all(p.stat().st_size == 0 for p in files) else "unknown"
+
+
+def list_sessions():
+    """(table rows, session folders), newest first."""
+    rows, jobs = [], []
+    if OUTPUT_ROOT.is_dir():
+        for job in sorted(OUTPUT_ROOT.iterdir(), reverse=True):
+            m = _JOB_NAME.match(job.name)
+            if not (m and job.is_dir()):
+                continue
+            meta = read_job(job)
+            when = datetime.strptime(m[1], "%Y%m%d-%H%M%S")
+            status = session_status(job, meta)
+            rows.append(
+                [f"{when:%m-%d %H:%M}", meta.get("kind", m[2]), STATUS_LABELS[status]]
+            )
+            jobs.append(str(job))
+    return rows, jobs
+
+
+def refresh_sessions():
+    rows, jobs = list_sessions()
+    return gr.update(value=rows or None), jobs
+
+
+def session_files(job, meta):
+    """Output files of a session: its folder's files plus outputs written elsewhere."""
+    files = [
+        p
+        for p in sorted(Path(job).iterdir())
+        if p.is_file() and p.name not in (JOB_FILE, JOB_LOG)
+    ]
+    seen = {p.resolve() for p in files}
+    files += [
+        Path(p)
+        for p in meta.get("outputs", [])
+        if Path(p).is_file() and Path(p).resolve() not in seen
+    ]
+    return files
+
+
+def _duration(meta):
+    try:
+        start = datetime.fromisoformat(meta["started"])
+        end = datetime.fromisoformat(meta["finished"])
+    except (KeyError, ValueError):
+        return None
+    secs = int((end - start).total_seconds())
+    return (
+        f"{secs // 3600}h {secs // 60 % 60}m"
+        if secs >= 3600
+        else f"{secs // 60}m {secs % 60}s"
+    )
+
+
+def session_view(job):
+    """Details markdown, log text and the send-to-tab targets of one session."""
+    job = Path(job)
+    meta = read_job(job)
+    kind = meta.get("kind") or _JOB_NAME.match(job.name)[2]
+    lines = [
+        f"### {kind} · {STATUS_LABELS[session_status(job, meta)]}",
+        f"`{job.name}`",
+        "",
+    ]
+    if "started" in meta:
+        took = _duration(meta)
+        lines.append(
+            f"Started {meta['started'].replace('T', ' ')}"
+            + (f" · took {took}" if took else "")
+        )
+    params = meta.get("params", {})
+    # A list, not a table: long paths would squeeze a table's first column in the sidebar.
+    for k, v in params.items():
+        name = f"**{k.replace('_', ' ')}**"
+        lines.append(f"- {name}<br>`{v}`" if os.sep in str(v) else f"- {name}: `{v}`")
+    files = session_files(job, meta)
+    if files:
+        # A list, like the settings: long file names would squeeze a table's size column.
+        lines += ["", "**Files**"]
+        lines += [f"- `{p.name}` · {human_size(p.stat().st_size)}" for p in files]
+    if meta.get("error"):
+        lines += ["", f"❌ {meta['error']}"]
+    try:
+        log = (job / JOB_LOG).read_text()
+    except OSError:
+        log = ""
+
+    def newest(suffix):
+        found = [p for p in files if p.suffix == suffix and p.stat().st_size > 0]
+        return str(max(found, key=os.path.getmtime)) if found else None
+
+    targets = {
+        "mgf": newest(".mgf"),
+        "vqms2": newest(".vqms2"),
+        "ckpt": newest(".ckpt"),
+        "params": params,
+    }
+    return "\n".join(lines), log, targets
+
+
+def select_session(jobs, evt: gr.SelectData):
+    row = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
+    if row is None or row >= len(jobs):
+        return tuple(gr.skip() for _ in range(7))
+    details, log, targets = session_view(jobs[row])
+    return (
+        details,
+        gr.update(value=log, visible=bool(log)),
+        targets,
+        gr.update(visible=bool(targets["mgf"])),
+        gr.update(visible=bool(targets["vqms2"])),
+        gr.update(visible=bool(targets["ckpt"])),
+        jobs[row],
+    )
+
+
+def send_to_decompress(targets):
+    params = targets.get("params", {})
+    return (
+        targets["vqms2"],
+        params.get("quantizers", gr.skip()),
+        params.get("method", gr.skip()),
+        params.get("level", gr.skip()),
+        gr.Tabs(selected="decompress"),
+    )
+
+
+# ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
 
 
 def build_ui():
-    default_ckpt = os.environ.get("SPECTROVQ_CKPT", "")
     with gr.Blocks(title="SpectroVQ") as demo:
         gr.Markdown(
             "# SpectroVQ\n"
@@ -753,6 +1156,31 @@ def build_ui():
             "Pretrained weights: [Zenodo](https://zenodo.org/records/20043624)."
         )
 
+        with gr.Sidebar(label="Sessions", open=True, width=380):
+            gr.Markdown(
+                "### Sessions\nPast runs in `gui_outputs/`. Click one for details."
+            )
+            ss_refresh = gr.Button("↻ Refresh", size="sm")
+            ss_table = gr.Dataframe(
+                headers=SESSION_HEADERS,
+                interactive=False,
+                wrap=True,
+                max_height=360,
+                show_label=False,
+                column_widths=["32%", "33%", "35%"],
+            )
+            ss_jobs, ss_targets = gr.State([]), gr.State({})
+            ss_job = gr.State(None)  # the selected session folder
+            ss_details = gr.Markdown()
+            ss_to_explore = gr.Button(
+                "Open output in Explore", size="sm", visible=False
+            )
+            ss_to_decompress = gr.Button("Send to Decompress", size="sm", visible=False)
+            ss_to_ckpt = gr.Button("Use as model checkpoint", size="sm", visible=False)
+            ss_log = gr.Textbox(
+                label="Log", lines=8, max_lines=8, visible=False, autoscroll=True
+            )
+
         with gr.Accordion("Model", open=True):
             with gr.Row():
                 with gr.Column(scale=4):
@@ -760,26 +1188,27 @@ def build_ui():
                         "Checkpoint (.ckpt) path on the server",
                         "*.ckpt",
                         "/path/to/SpectroVQ.ckpt",
-                        value=default_ckpt,
+                        value=initial_ckpt,  # re-read on every page load
                     )
                 with gr.Column(scale=2):
                     yaml_cfg, _ = host_file_picker(
-                        "Model YAML (optional)", "*.yaml", "modelParams.yaml"
+                        "Model YAML (optional)",
+                        "*.yaml",
+                        "modelParams.yaml",
+                        value=initial_yaml,
                     )
                 with gr.Column(scale=1):
                     device = gr.Dropdown(
                         available_devices(), value="auto", label="Device"
                     )
                     load_btn = gr.Button("Load model")
-            status = gr.Markdown(
-                "_No model loaded yet. It is loaded automatically on first use._"
-            )
+            status = gr.Markdown(initial_model_status)  # re-run on every page load
             load_btn.click(model_status, [ckpt, yaml_cfg, device], status)
         model_inputs = [ckpt, yaml_cfg, device]
 
-        with gr.Tabs():
+        with gr.Tabs() as tabs:
             # ---------------- Explore ----------------
-            with gr.Tab("Explore"):
+            with gr.Tab("Explore", id="explore"):
                 gr.Markdown(
                     "Reconstruct one spectrum with a chosen number of quantizers and see how similarity "
                     "grows as quantizers are added."
@@ -811,7 +1240,7 @@ def build_ui():
                 ex_q.release(explore_run, ex_args, ex_outs)
 
             # ---------------- Denoise ----------------
-            with gr.Tab("Denoise"):
+            with gr.Tab("Denoise", id="denoise"):
                 dn_in, dn_out = gr.State(None), gr.State(None)
                 with gr.Row():
                     with gr.Column(scale=1):
@@ -835,8 +1264,11 @@ def build_ui():
                         dn_comp = gr.Checkbox(
                             True, label="Reconstruct chimeric spectra"
                         )
+                        dn_outfile = gr.Textbox(
+                            label="Export path on the server",
+                            placeholder="empty = <session folder>/<name>_denoised.mgf",
+                        )
                         dn_btn = gr.Button("Denoise", variant="primary")
-                        dn_result = gr.File(label="Download denoised MGF")
                     with gr.Column(scale=2):
                         dn_log = gr.Textbox(
                             label="Log", lines=14, max_lines=14, autoscroll=True
@@ -847,14 +1279,24 @@ def build_ui():
                         dn_plot = gr.Plot(label="Original vs denoised")
                 dn_btn.click(
                     denoise_run,
-                    [dn_file, dn_q, dn_retain, dn_thr, dn_comp, *model_inputs],
-                    [dn_log, dn_result, dn_idx, dn_in, dn_out],
+                    [
+                        dn_file,
+                        dn_outfile,
+                        dn_q,
+                        dn_retain,
+                        dn_thr,
+                        dn_comp,
+                        *model_inputs,
+                    ],
+                    [dn_log, dn_idx, dn_in, dn_out],
                     concurrency_id="pipeline",
-                ).then(denoise_preview, [dn_in, dn_out, dn_idx], dn_plot)
+                ).then(denoise_preview, [dn_in, dn_out, dn_idx], dn_plot).then(
+                    refresh_sessions, None, [ss_table, ss_jobs]
+                )
                 dn_idx.release(denoise_preview, [dn_in, dn_out, dn_idx], dn_plot)
 
             # ---------------- Compress ----------------
-            with gr.Tab("Compress"):
+            with gr.Tab("Compress", id="compress"):
                 with gr.Row():
                     with gr.Column(scale=1):
                         cp_file, _ = host_file_picker(
@@ -874,24 +1316,33 @@ def build_ui():
                             )
                             cp_level = gr.Number(6, precision=0, label="Level")
                         cp_bs = gr.Number(32, precision=0, label="Batch size")
+                        cp_outdir = gr.Textbox(
+                            label="Export folder on the server",
+                            placeholder="empty = the session folder",
+                        )
                         cp_btn = gr.Button("Compress", variant="primary")
                     with gr.Column(scale=2):
                         cp_log = gr.Textbox(
                             label="Log", lines=12, max_lines=12, autoscroll=True
                         )
                         cp_summary = gr.Markdown()
-                        cp_result = gr.File(
-                            label="Download compressed files", file_count="multiple"
-                        )
                 cp_btn.click(
                     compress_run,
-                    [cp_file, cp_q, cp_method, cp_level, cp_bs, *model_inputs],
-                    [cp_log, cp_result, cp_summary],
+                    [
+                        cp_file,
+                        cp_outdir,
+                        cp_q,
+                        cp_method,
+                        cp_level,
+                        cp_bs,
+                        *model_inputs,
+                    ],
+                    [cp_log, cp_summary],
                     concurrency_id="pipeline",
-                )
+                ).then(refresh_sessions, None, [ss_table, ss_jobs])
 
             # ---------------- Decompress ----------------
-            with gr.Tab("Decompress"):
+            with gr.Tab("Decompress", id="decompress"):
                 with gr.Row():
                     with gr.Column(scale=1):
                         dc_files, _ = host_file_picker(
@@ -917,21 +1368,33 @@ def build_ui():
                         dc_raw = gr.Checkbox(
                             False, label="Also write raw (non-chimeric) reconstructions"
                         )
+                        dc_outfile = gr.Textbox(
+                            label="Export path on the server",
+                            placeholder="empty = <session folder>/<name>_decompressed.mgf",
+                        )
                         dc_btn = gr.Button("Decompress", variant="primary")
                     with gr.Column(scale=2):
                         dc_log = gr.Textbox(
                             label="Log", lines=14, max_lines=14, autoscroll=True
                         )
-                        dc_result = gr.File(label="Download decompressed MGF")
                 dc_btn.click(
                     decompress_run,
-                    [dc_files, dc_q, dc_method, dc_level, dc_bs, dc_raw, *model_inputs],
-                    [dc_log, dc_result],
+                    [
+                        dc_files,
+                        dc_outfile,
+                        dc_q,
+                        dc_method,
+                        dc_level,
+                        dc_bs,
+                        dc_raw,
+                        *model_inputs,
+                    ],
+                    dc_log,
                     concurrency_id="pipeline",
-                )
+                ).then(refresh_sessions, None, [ss_table, ss_jobs])
 
             # ---------------- Train ----------------
-            with gr.Tab("Train"):
+            with gr.Tab("Train", id="train"):
                 gr.Markdown(
                     "Runs `train.py` in a separate process. The library is a `.feather` consensus library "
                     "with columns `PrecursorMZ`, `CompoundName`, `Comment`, `m/z`, `intensity`, `Charge`. "
@@ -970,8 +1433,138 @@ def build_ui():
                     [tr_data, tr_out, tr_bs, tr_lr, tr_ep, tr_nw],
                     [tr_log, tr_ckpts],
                     concurrency_limit=1,
-                )
+                ).then(refresh_sessions, None, [ss_table, ss_jobs])
                 tr_stop.click(train_stop, None, tr_stop_msg)
+
+        # ---------------- Sessions sidebar ----------------
+        light = {"queue": False, "show_progress": "hidden"}
+
+        # Where each kind of run lives: its tab, log box, inputs (component -> job.json
+        # setting) and how to show its outputs once done.
+        def file_listing(title):
+            def show(outs):
+                return f"**{title}:**\n\n" + (
+                    "\n".join(f"- `{p}`" for p in outs) or "_None written._"
+                )
+
+            return show
+
+        session_tabs = {
+            "denoise": (
+                "denoise",
+                dn_log,
+                {dn_file: "input", dn_q: "quantizers"},
+                None,
+                None,
+            ),
+            "compress": (
+                "compress",
+                cp_log,
+                {
+                    cp_file: "input",
+                    cp_q: "quantizers",
+                    cp_method: "method",
+                    cp_level: "level",
+                },
+                cp_summary,
+                file_listing("Compressed files"),
+            ),
+            "decompress": (
+                "decompress",
+                dc_log,
+                {
+                    dc_files: "input",
+                    dc_q: "quantizers",
+                    dc_method: "method",
+                    dc_level: "level",
+                },
+                None,
+                None,
+            ),
+            "train": (
+                "train",
+                tr_log,
+                {tr_data: "input"},
+                tr_ckpts,
+                file_listing("Checkpoints"),
+            ),
+        }
+        watch_outputs = [tabs, ss_table, ss_jobs, ss_details, ss_log]
+        for _, log_box, inputs, result_box, _ in session_tabs.values():
+            watch_outputs += [log_box, *inputs] + ([result_box] if result_box else [])
+
+        def watch_session(job):
+            """Put a running session back in its tab and stream its log there until it ends."""
+            meta = read_job(job) if job else {}
+            view = session_tabs.get(meta.get("kind"))
+            if view is None or not job_running(job, meta):
+                yield {c: gr.skip() for c in watch_outputs}
+                return
+            tab, log_box, inputs, result_box, show = view
+            params = meta.get("params", {})
+            yield {
+                tabs: gr.Tabs(selected=tab),
+                **{c: params[k] for c, k in inputs.items() if k in params},
+            }
+            log_file = Path(job) / JOB_LOG
+            while job_running(job, read_job(job)):
+                buf = _ACTIVE_JOBS.get(job)  # live buffer if the run is in this process
+                if buf is not None or log_file.exists():
+                    text = buf.get() if buf is not None else log_file.read_text()
+                    yield {log_box: text, ss_log: gr.update(value=text, visible=True)}
+                time.sleep(1)
+            meta = read_job(job)
+            details, log, _ = session_view(job)
+            outs = [p for p in meta.get("outputs", []) if os.path.isfile(p)]
+            if meta.get("status") == "done":
+                end = "✅ Done." + "".join(f"\nSaved on the server: {p}" for p in outs)
+            else:
+                end = f"❌ {meta.get('error')}"
+            rows, jobs = list_sessions()
+            yield {
+                log_box: f"{log}\n{end}",
+                **({result_box: show(outs)} if result_box else {}),
+                ss_table: gr.update(value=rows or None),
+                ss_jobs: jobs,
+                ss_details: details,
+                ss_log: gr.update(value=log, visible=bool(log)),
+            }
+
+        demo.load(refresh_sessions, None, [ss_table, ss_jobs], **light)
+        ss_refresh.click(refresh_sessions, None, [ss_table, ss_jobs], **light)
+        ss_table.select(
+            select_session,
+            ss_jobs,
+            [
+                ss_details,
+                ss_log,
+                ss_targets,
+                ss_to_explore,
+                ss_to_decompress,
+                ss_to_ckpt,
+                ss_job,
+            ],
+            **light,
+        ).then(
+            watch_session,
+            ss_job,
+            watch_outputs,
+            concurrency_limit=None,
+            show_progress="hidden",
+        )
+        ss_to_explore.click(
+            lambda t: (t["mgf"], gr.Tabs(selected="explore")),
+            ss_targets,
+            [ex_file, tabs],
+            **light,
+        ).then(explore_load, ex_file, [ex_idx, ex_info, ex_path])
+        ss_to_decompress.click(
+            send_to_decompress,
+            ss_targets,
+            [dc_files, dc_q, dc_method, dc_level, tabs],
+            **light,
+        )
+        ss_to_ckpt.click(lambda t: t["ckpt"], ss_targets, ckpt, **light)
     return demo
 
 
@@ -986,7 +1579,11 @@ def main():
     parser.add_argument(
         "--share", action="store_true", help="Create a public Gradio share link"
     )
-    parser.add_argument("--ckpt", default=None, help="Pre-fill the checkpoint path")
+    parser.add_argument(
+        "--ckpt",
+        default=None,
+        help="Pre-fill the checkpoint path (default: the last model that loaded, saved in gui_config.json)",
+    )
     parser.add_argument(
         "--root",
         default=str(ROOT),
@@ -1003,7 +1600,8 @@ def main():
         server_name=args.host,
         server_port=args.port,
         share=args.share,
-        allowed_paths=[str(OUTPUT_ROOT)],
+        # Long paths in the sessions sidebar have few break points; let them wrap anywhere.
+        css=".sidebar code { overflow-wrap: anywhere; }",
     )
 
 
