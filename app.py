@@ -19,6 +19,7 @@ Run on the server, then reach it e.g. through an SSH tunnel (ssh -L 7860:localho
 
 import argparse
 import contextlib
+import functools
 import io
 import json
 import os
@@ -950,6 +951,7 @@ def train_run(data_path, output_dir, batch_size, lr, max_epochs, num_workers):
     _ACTIVE_JOBS[str(job)] = buf
     buf.write("$ " + " ".join(cmd) + "\n")
     mirror_log(job, buf, lambda: proc.poll() is None)
+    yield buf.get(), gr.update()  # first update right away (also refreshes the sidebar)
 
     def pump():
         for line in proc.stdout:
@@ -1037,6 +1039,25 @@ def list_sessions():
 def refresh_sessions():
     rows, jobs = list_sessions()
     return gr.update(value=rows or None), jobs
+
+
+def with_session_list(job_fn):
+    """Wrap a job generator so its event also outputs the sessions sidebar (table, folders):
+    refreshed on its first update, which comes right after it creates its session folder, and
+    again when it ends. The sidebar then reacts to the run starting and finishing."""
+
+    @functools.wraps(job_fn)
+    def run(*args):
+        n = None
+        for out in job_fn(*args):
+            out = out if isinstance(out, tuple) else (out,)
+            sessions = refresh_sessions() if n is None else (gr.skip(), gr.skip())
+            n = len(out)
+            yield (*out, *sessions)
+        if n is not None:
+            yield (*(gr.skip() for _ in range(n)), *refresh_sessions())
+
+    return run
 
 
 def session_files(job, meta):
@@ -1278,7 +1299,7 @@ def build_ui():
                         )
                         dn_plot = gr.Plot(label="Original vs denoised")
                 dn_btn.click(
-                    denoise_run,
+                    with_session_list(denoise_run),
                     [
                         dn_file,
                         dn_outfile,
@@ -1288,11 +1309,9 @@ def build_ui():
                         dn_comp,
                         *model_inputs,
                     ],
-                    [dn_log, dn_idx, dn_in, dn_out],
+                    [dn_log, dn_idx, dn_in, dn_out, ss_table, ss_jobs],
                     concurrency_id="pipeline",
-                ).then(denoise_preview, [dn_in, dn_out, dn_idx], dn_plot).then(
-                    refresh_sessions, None, [ss_table, ss_jobs]
-                )
+                ).then(denoise_preview, [dn_in, dn_out, dn_idx], dn_plot)
                 dn_idx.release(denoise_preview, [dn_in, dn_out, dn_idx], dn_plot)
 
             # ---------------- Compress ----------------
@@ -1327,7 +1346,7 @@ def build_ui():
                         )
                         cp_summary = gr.Markdown()
                 cp_btn.click(
-                    compress_run,
+                    with_session_list(compress_run),
                     [
                         cp_file,
                         cp_outdir,
@@ -1337,9 +1356,9 @@ def build_ui():
                         cp_bs,
                         *model_inputs,
                     ],
-                    [cp_log, cp_summary],
+                    [cp_log, cp_summary, ss_table, ss_jobs],
                     concurrency_id="pipeline",
-                ).then(refresh_sessions, None, [ss_table, ss_jobs])
+                )
 
             # ---------------- Decompress ----------------
             with gr.Tab("Decompress", id="decompress"):
@@ -1378,7 +1397,7 @@ def build_ui():
                             label="Log", lines=14, max_lines=14, autoscroll=True
                         )
                 dc_btn.click(
-                    decompress_run,
+                    with_session_list(decompress_run),
                     [
                         dc_files,
                         dc_outfile,
@@ -1389,9 +1408,9 @@ def build_ui():
                         dc_raw,
                         *model_inputs,
                     ],
-                    dc_log,
+                    [dc_log, ss_table, ss_jobs],
                     concurrency_id="pipeline",
-                ).then(refresh_sessions, None, [ss_table, ss_jobs])
+                )
 
             # ---------------- Train ----------------
             with gr.Tab("Train", id="train"):
@@ -1429,11 +1448,11 @@ def build_ui():
                         )
                         tr_ckpts = gr.Markdown()
                 tr_btn.click(
-                    train_run,
+                    with_session_list(train_run),
                     [tr_data, tr_out, tr_bs, tr_lr, tr_ep, tr_nw],
-                    [tr_log, tr_ckpts],
+                    [tr_log, tr_ckpts, ss_table, ss_jobs],
                     concurrency_limit=1,
-                ).then(refresh_sessions, None, [ss_table, ss_jobs])
+                )
                 tr_stop.click(train_stop, None, tr_stop_msg)
 
         # ---------------- Sessions sidebar ----------------
