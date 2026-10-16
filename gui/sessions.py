@@ -9,7 +9,7 @@ from typing import NamedTuple
 
 import gradio as gr
 
-from gui.config import OUTPUT_ROOT
+from gui import config
 from gui.jobs import JOB_FILE, JOB_LOG, JOB_NAME, job_running, read_job
 from gui.paths import human_size
 
@@ -38,8 +38,8 @@ def session_status(job, meta):
 def list_sessions():
     """(table rows, session folders), newest first."""
     rows, jobs = [], []
-    if OUTPUT_ROOT.is_dir():
-        for job in sorted(OUTPUT_ROOT.iterdir(), reverse=True):
+    if config.OUTPUT_ROOT.is_dir():
+        for job in sorted(config.OUTPUT_ROOT.iterdir(), reverse=True):
             m = JOB_NAME.match(job.name)
             if not (m and job.is_dir()):
                 continue

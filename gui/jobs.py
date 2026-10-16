@@ -12,7 +12,7 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
-from gui.config import OUTPUT_ROOT
+from gui import config
 
 # Every run gets a gui_outputs/<YYYYmmdd-HHMMSS>_<kind>_<random>/ folder ("session") holding its
 # outputs, a job.json record (kind, settings, status, outputs) and its log (job.log).
@@ -39,10 +39,10 @@ def write_job(job, meta):
 
 
 def new_job_dir(prefix, **params):
-    OUTPUT_ROOT.mkdir(exist_ok=True)
+    config.OUTPUT_ROOT.mkdir(exist_ok=True)
     job = Path(
         tempfile.mkdtemp(
-            prefix=f"{datetime.now():%Y%m%d-%H%M%S}_{prefix}_", dir=OUTPUT_ROOT
+            prefix=f"{datetime.now():%Y%m%d-%H%M%S}_{prefix}_", dir=config.OUTPUT_ROOT
         )
     )
     write_job(

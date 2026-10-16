@@ -8,6 +8,7 @@ from typing import Any
 
 import gradio as gr
 
+from gui import config
 from gui.jobs import ACTIVE_JOBS, JOB_LOG, job_running, read_job
 from gui.sessions import (
     SESSION_HEADERS,
@@ -20,7 +21,9 @@ from gui.tabs.explore import explore_load
 
 def build():
     with gr.Sidebar(label="Sessions", open=True, width=380):
-        gr.Markdown("### Sessions\nPast runs in `gui_outputs/`. Click one for details.")
+        gr.Markdown(
+            f"### Sessions\nPast runs in `{config.OUTPUT_ROOT}`. Click one for details."
+        )
         sb = SimpleNamespace(
             refresh=gr.Button("↻ Refresh", size="sm"),
             table=gr.Dataframe(

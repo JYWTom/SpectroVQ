@@ -7,9 +7,15 @@ from pathlib import Path
 # The SpectroVQ project folder.
 ROOT = Path(__file__).resolve().parent.parent
 
-OUTPUT_ROOT = ROOT / "gui_outputs"
+# Per-user state, so several people can run the GUI from one shared install; set with --data-dir.
+DATA_DIR = Path.home() / ".spectrovq"
+OUTPUT_ROOT = DATA_DIR / "gui_outputs"
+# Server-side GUI settings that outlive restarts: the last model that loaded successfully.
+CONFIG_PATH = DATA_DIR / "gui_config.json"
+# Running servers' URLs and tokens, for `gui.py --list`.
+RUNTIME_DIR = DATA_DIR / "runtime"
 # Starting folder of the "Browse ..." file browsers; set with --root. '..' and typed paths go anywhere.
-BROWSE_ROOT = str(ROOT)
+BROWSE_ROOT = str(Path.home())
 
 # Binning parameters; must match train.py, the compressor/decompressor and the denoiser.
 BIN_SIZE = 0.1
@@ -17,8 +23,16 @@ SPECTRA_DIMENSION = 13500
 MZ_RANGE = [150, 1500]
 CODE_BITS = 10
 
-# Server-side GUI settings that outlive restarts: the last model that loaded successfully.
-CONFIG_PATH = ROOT / "gui_config.json"
+
+def set_data_dir(path):
+    """Point all per-user state at path, creating it readable by its owner only."""
+    global DATA_DIR, OUTPUT_ROOT, CONFIG_PATH, RUNTIME_DIR
+    DATA_DIR = Path(path).expanduser().resolve()
+    OUTPUT_ROOT = DATA_DIR / "gui_outputs"
+    CONFIG_PATH = DATA_DIR / "gui_config.json"
+    RUNTIME_DIR = DATA_DIR / "runtime"
+    for d in (DATA_DIR, OUTPUT_ROOT, RUNTIME_DIR):
+        d.mkdir(mode=0o700, parents=True, exist_ok=True)
 
 
 def read_config():
