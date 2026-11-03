@@ -35,7 +35,10 @@ def read_job(job):
 
 
 def write_job(job, meta):
-    (Path(job) / JOB_FILE).write_text(json.dumps(meta, indent=2))
+    path = Path(job) / JOB_FILE
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(meta, indent=2))
+    os.replace(tmp, path)  # atomic, so a crash never leaves half a record
 
 
 def new_job_dir(prefix, **params):
@@ -97,13 +100,25 @@ def mirror_log(job, buf, alive, every=2.0):
     threading.Thread(target=run, daemon=True).start()
 
 
-def finish_job(job, outputs=None, error=None, log=""):
-    """Record a session's outcome: status, finish time, output paths, error and log."""
+def reopen_job(job):
+    """Mark a stopped session as running again, in this process, for a resumed run."""
+    meta = read_job(job)
+    for key in ("finished", "error", "outputs"):
+        meta.pop(key, None)
+    write_job(job, {**meta, "status": "running", "pid": os.getpid()})
+    ACTIVE_JOBS[str(job)] = None
+
+
+def finish_job(job, outputs=None, error=None, log="", status=None):
+    """Record a session's outcome: status, finish time, output paths, error and log.
+
+    The status follows from the error unless given (a paused run is neither done nor failed).
+    """
     if isinstance(outputs, (str, os.PathLike)):
         outputs = [outputs]
     meta = read_job(job)
     meta.update(
-        status="failed" if error else "done",
+        status=status or ("failed" if error else "done"),
         finished=_now(),
         outputs=[str(p) for p in outputs or []],
     )

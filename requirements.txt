@@ -49,6 +49,7 @@ pydantic_core==2.41.5
 Pygments==2.19.2
 pyparsing==3.3.2
 pyteomics==4.7.5
+pytest
 python-dateutil==2.9.0.post0
 pytorch-lightning==2.6.1
 PyYAML==6.0.3
