@@ -32,12 +32,11 @@
 """Core vector quantization implementation."""
 
 import typing as tp
-import warnings
 
-from einops import rearrange, repeat
 import torch
-from torch import nn
 import torch.nn.functional as F
+from einops import rearrange, repeat
+from torch import nn
 
 # from .. import distrib
 from . import distrib
@@ -47,8 +46,9 @@ def default(val: tp.Any, d: tp.Any) -> tp.Any:
     return val if val is not None else d
 
 
+@torch.no_grad()
 def ema_inplace(moving_avg, new, decay: float):
-    moving_avg.data.mul_(decay).add_(new, alpha=(1 - decay))
+    moving_avg.mul_(decay).add_(new, alpha=(1 - decay))
 
 
 def laplace_smoothing(x, n_categories: int, epsilon: float = 1e-5):
@@ -111,6 +111,12 @@ class EuclideanCodebook(nn.Module):
             randomly selected vector from the current batch.
     """
 
+    # Registered in __init__ with register_buffer; declared for type checkers.
+    inited: torch.Tensor
+    cluster_size: torch.Tensor
+    embed: torch.Tensor
+    embed_avg: torch.Tensor
+
     def __init__(
         self,
         dim: int,
@@ -123,7 +129,7 @@ class EuclideanCodebook(nn.Module):
     ):
         super().__init__()
         self.decay = decay
-        init_fn: tp.Union[tp.Callable[..., torch.Tensor], tp.Any] = (
+        init_fn: tp.Callable[..., torch.Tensor] | tp.Any = (
             uniform_init if not kmeans_init else torch.zeros
         )
         embed = init_fn(codebook_size, dim)
@@ -140,23 +146,25 @@ class EuclideanCodebook(nn.Module):
         self.register_buffer("embed_avg", embed.clone())
 
     @torch.jit.ignore
+    @torch.no_grad()
     def init_embed_(self, data):
         if self.inited:
             return
 
         embed, cluster_size = kmeans(data, self.codebook_size, self.kmeans_iters)
-        self.embed.data.copy_(embed)
-        self.embed_avg.data.copy_(embed.clone())
-        self.cluster_size.data.copy_(cluster_size)
-        self.inited.data.copy_(torch.Tensor([True]))
+        self.embed.copy_(embed)
+        self.embed_avg.copy_(embed.clone())
+        self.cluster_size.copy_(cluster_size)
+        self.inited.copy_(torch.Tensor([True]))
         # Make sure all buffers across workers are in sync after initialization
         distrib.broadcast_tensors(self.buffers())
 
+    @torch.no_grad()
     def replace_(self, samples, mask):
         modified_codebook = torch.where(
             mask[..., None], sample_vectors(samples, self.codebook_size), self.embed
         )
-        self.embed.data.copy_(modified_codebook)
+        self.embed.copy_(modified_codebook)
 
     def expire_codes_(self, batch_samples):
         if self.threshold_ema_dead_code == 0:
@@ -228,7 +236,8 @@ class EuclideanCodebook(nn.Module):
                 * self.cluster_size.sum()
             )
             embed_normalized = self.embed_avg / cluster_size.unsqueeze(1)
-            self.embed.data.copy_(embed_normalized)
+            with torch.no_grad():
+                self.embed.copy_(embed_normalized)
 
         return quantize, embed_ind
 
@@ -254,7 +263,7 @@ class VectorQuantization(nn.Module):
         self,
         dim: int,
         codebook_size: int,
-        codebook_dim: tp.Optional[int] = None,
+        codebook_dim: int | None = None,
         decay: float = 0.99,
         epsilon: float = 1e-5,
         kmeans_init: bool = True,
@@ -325,15 +334,11 @@ class VectorQuantization(nn.Module):
 
         loss = torch.tensor([0.0], device=device, requires_grad=self.training)
 
-        if self.training:
-            warnings.warn(
-                "When using RVQ in training model, first check "
-                "https://github.com/facebookresearch/encodec/issues/25 . "
-                "The bug wasn't fixed here for reproducibility."
-            )
-            if self.commitment_weight > 0:
-                commit_loss = F.mse_loss(quantize.detach(), x)
-                loss = loss + commit_loss * self.commitment_weight
+        # Known issue, kept for reproducibility (this was a per-forward warning):
+        # https://github.com/facebookresearch/encodec/issues/25
+        if self.training and self.commitment_weight > 0:
+            commit_loss = F.mse_loss(quantize.detach(), x)
+            loss = loss + commit_loss * self.commitment_weight
 
         quantize = self.project_out(quantize)
         quantize = rearrange(quantize, "b n d -> b d n")
@@ -352,7 +357,7 @@ class ResidualVectorQuantization(nn.Module):
         )
         self.l2norm = l2norm
 
-    def forward(self, x, n_q: tp.Optional[int] = None):
+    def forward(self, x, n_q: int | None = None):
         quantized_out = 0.0
         residual = x
 
@@ -375,15 +380,16 @@ class ResidualVectorQuantization(nn.Module):
         out_losses, out_indices = map(torch.stack, (all_losses, all_indices))
         return quantized_out, out_indices, out_losses
 
-    def encode(self, x: torch.Tensor, n_q: tp.Optional[int] = None) -> torch.Tensor:
+    def encode(self, x: torch.Tensor, n_q: int | None = None) -> torch.Tensor:
         residual = x
         all_indices = []
         n_q = n_q or len(self.layers)
         for layer in self.layers[:n_q]:
             # Modified with L2 Norm from https://arxiv.org/abs/2306.06546
             # residual = nn.functional.normalize(residual, p=2, dim=1)
-            indices = layer.encode(residual)
-            quantized = layer.decode(indices)
+            vq = tp.cast(VectorQuantization, layer)
+            indices = vq.encode(residual)
+            quantized = vq.decode(indices)
             residual = residual - quantized
             all_indices.append(indices)
         out_indices = torch.stack(all_indices)
@@ -392,12 +398,12 @@ class ResidualVectorQuantization(nn.Module):
     def decode(self, q_indices: torch.Tensor) -> torch.Tensor:
         quantized_out = torch.tensor(0.0, device=q_indices.device)
         for i, indices in enumerate(q_indices):
-            layer = self.layers[i]
+            layer = tp.cast(VectorQuantization, self.layers[i])
             quantized = layer.decode(indices)
             quantized_out = quantized_out + quantized
         return quantized_out
 
-    def encodeWithLoss(self, x, n_q: tp.Optional[int] = None):
+    def encodeWithLoss(self, x, n_q: int | None = None):
         quantized_out = 0.0
         residual = x
 
@@ -410,7 +416,9 @@ class ResidualVectorQuantization(nn.Module):
             # Modified with L2 Norm from https://arxiv.org/abs/2306.06546
             if self.l2norm:
                 residual = nn.functional.normalize(residual, p=2, dim=1)
-            quantized, indices, loss = layer.encodeWithLoss(residual)
+            quantized, indices, loss = tp.cast(
+                VectorQuantization, layer
+            ).encodeWithLoss(residual)
             residual = (
                 residual - quantized.detach()
             )  # issue suggested in https://github.com/facebookresearch/encodec/issues/25

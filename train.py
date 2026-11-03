@@ -20,6 +20,8 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset, Sampler
 from transformers import get_cosine_schedule_with_warmup
 
+from utils.compile import COMPILE_MODES, compile_model
+from utils.device import resolve_device
 from utils.model import modelStream
 from utils.SpectrumProcessing.SpectraLoading import massSpectrumToVector
 
@@ -326,6 +328,7 @@ def peak_portion(input, target, dim=2):
 
 
 weightCS, weightSE = 1.0, 1.0
+NAN_CHECK_EVERY = 100  # training steps between NaN checks of the loss
 
 
 class LightningModelSpectraStream(L.LightningModule):
@@ -339,7 +342,7 @@ class LightningModelSpectraStream(L.LightningModule):
         self.len_test_loader = len_test_loader
         self.learning_rate = learning_rate
         self.AverageTestLossList = []
-        self.AverageTrainingLoss = []
+        self._pending_train_losses = []  # detached, still on the device: no per-step sync
         self.rng = np.random.default_rng(42)
 
     def training_step(self, batch, batch_idx):
@@ -361,11 +364,22 @@ class LightningModelSpectraStream(L.LightningModule):
             print(f"QuantizeLoss: {QuantizeLoss.item()}")
             print(f"SELoss: {SE_Loss.item()}")
 
-        if torch.isnan(loss):
-            print(f"NAN Loss Detected at Training batch {batch_idx}")
-        else:
-            self.AverageTrainingLoss.append(loss.item())
+        # Checking for NaN every step would force a host sync; check in groups instead.
+        self._pending_train_losses.append(loss.detach())
+        if len(self._pending_train_losses) >= NAN_CHECK_EVERY:
+            self._check_train_losses(batch_idx)
         return loss
+
+    def _check_train_losses(self, batch_idx):
+        if not self._pending_train_losses:
+            return
+        losses = torch.stack(self._pending_train_losses)
+        self._pending_train_losses.clear()
+        n_nan = int(torch.isnan(losses).sum())
+        if n_nan:
+            print(
+                f"NAN Loss Detected in {n_nan} training batches up to batch {batch_idx}"
+            )
 
     def validation_step(self, batch, batch_idx):
 
@@ -391,8 +405,8 @@ class LightningModelSpectraStream(L.LightningModule):
         self.log("val_loss", loss, sync_dist=True, on_epoch=True)
 
     def on_train_epoch_end(self):
-        self.AverageTrainingLoss.clear()
-        self.rng = np.random.default_rng(42 + self.rng.integers(0, 1000))
+        self._check_train_losses(self.trainer.global_step)
+        self.rng = np.random.default_rng(42 + int(self.rng.integers(0, 1000)))
 
     def on_validation_epoch_end(self):
         AverageTLoss = np.mean(self.AverageTestLossList)
@@ -400,7 +414,11 @@ class LightningModelSpectraStream(L.LightningModule):
         self.AverageTestLossList.clear()
         val_loader = self.trainer.val_dataloaders
         assert val_loader is not None  # this hook only runs when validating
-        val_loader.dataset.epoch += 1
+        # Not for the sanity check: Lightning skips it when it resumes mid-epoch but runs it when
+        # it resumes at an epoch boundary, which would shift the validation augmentation of a
+        # resumed run by one epoch.
+        if not self.trainer.sanity_checking:
+            val_loader.dataset.epoch += 1
 
     def configure_optimizers(self):
         warmup_epochs = 7
@@ -422,10 +440,11 @@ class LightningModelSpectraStream(L.LightningModule):
 
 
 class ResumeState(Callback):
-    """Sampler position and RNG states, stored in the checkpoint (what Lightning leaves out).
+    """Sampler position, stored in the checkpoint (what Lightning leaves out).
 
-    Holds only ints, lists, dicts of those and tensors: ApplyWeights reads checkpoints with
-    the default torch.load.
+    Holds only ints, bools and strings: ApplyWeights reads checkpoints with the default
+    torch.load. Model RNG state is deliberately not saved: a resumed run is correct, not
+    bit-identical.
     """
 
     # Set in setup(), which Lightning calls before any checkpoint is saved.
@@ -435,18 +454,10 @@ class ResumeState(Callback):
     def __init__(self, sampler, val_dataset):
         self.sampler, self.val_dataset = sampler, val_dataset
         self.batches_done = 0  # finished this epoch
-        self._rng_to_restore = None
         self._should_stop = False
 
     def setup(self, trainer, pl_module, stage):
         self.trainer, self.module = trainer, pl_module
-
-    def _generators(self):
-        """The model's numpy generators: VQ on/off and quantizer dropout."""
-        gens = {"module_rng": self.module.rng}
-        if hasattr(self.module.model, "rng"):
-            gens["model_rng"] = self.module.model.rng
-        return gens
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         self.batches_done += 1
@@ -455,13 +466,6 @@ class ResumeState(Callback):
         self.batches_done = 0
 
     def state_dict(self):
-        rng = {"torch": torch.get_rng_state()}
-        if torch.cuda.is_available():
-            rng["cuda"] = torch.cuda.get_rng_state_all()
-        if torch.backends.mps.is_available():
-            rng["mps"] = torch.mps.get_rng_state()
-        for name, gen in self._generators().items():
-            rng[name] = gen.bit_generator.state
         return {
             # What Lightning passes to set_epoch, not current_epoch (which reads `completed`).
             # A _ProcessedTracker at runtime; Lightning declares the narrower base type.
@@ -469,7 +473,6 @@ class ResumeState(Callback):
             "batches_done": self.batches_done,
             "val_epoch": self.val_dataset.epoch,
             "should_stop": bool(self.trainer.should_stop),
-            "rng": rng,
         }
 
     def load_state_dict(self, state_dict):
@@ -479,23 +482,10 @@ class ResumeState(Callback):
         self.sampler.skip_batches = self.batches_done = state_dict["batches_done"]
         self.val_dataset.epoch = state_dict["val_epoch"]
         self._should_stop = state_dict["should_stop"]
-        self._rng_to_restore = state_dict["rng"]
 
     def on_train_start(self, trainer, pl_module):
-        # Not on load: creating the data iterator draws a seed from the torch RNG. Restoring
-        # after it puts the RNG back where the uninterrupted run had it.
-        rng, self._rng_to_restore = self._rng_to_restore, None
-        if rng is None:
-            return
         # Lightning resets this on every fit, so an early stop just before a pause would be lost.
         trainer.should_stop = self._should_stop
-        torch.set_rng_state(rng["torch"].cpu())
-        if "cuda" in rng and torch.cuda.is_available():
-            torch.cuda.set_rng_state_all([s.cpu() for s in rng["cuda"]])
-        if "mps" in rng and torch.backends.mps.is_available():
-            torch.mps.set_rng_state(rng["mps"].cpu())
-        for name, gen in self._generators().items():
-            gen.bit_generator.state = rng[name]
 
 
 class ResumeCheckpoint(ModelCheckpoint):
@@ -572,7 +562,7 @@ def parse_args(argv=None):
         "--resume",
         action="store_true",
         help="continue from <output_dir>/resume/resume.ckpt; use the same --batch_size, "
-        "--max_epochs, --deterministic and library as the first run",
+        "--max_epochs and library as the first run",
     )
     parser.add_argument(
         "--checkpoint_minutes",
@@ -581,15 +571,17 @@ def parse_args(argv=None):
         help="minutes between resume checkpoints",
     )
     parser.add_argument(
-        "--deterministic",
-        action="store_true",
-        help="use deterministic algorithms, for exact GPU resumes (slower)",
-    )
-    parser.add_argument(
         "--accelerator",
         type=str,
         default="auto",
         help="Lightning accelerator: auto, cpu, cuda, mps",
+    )
+    parser.add_argument(
+        "--compile",
+        choices=COMPILE_MODES,
+        default="none",
+        help="torch.compile the encoder and decoder (CUDA only; the quantizer stays eager). "
+        "Checkpoints and --resume still work.",
     )
     return parser.parse_args(argv)
 
@@ -619,6 +611,8 @@ def main(argv=None, extra_callbacks=()):
 
     num_epochs = args.max_epochs
     SpectraStream = modelStream.SpectroVQ(**model_kwargs2)
+    if args.compile != "none":
+        compile_model(SpectraStream, args.compile, resolve_device(args.accelerator))
     learning_rate = args.learning_rate
     batch_size = args.batch_size
     print("Preprocessing Training Data")
@@ -692,7 +686,6 @@ def main(argv=None, extra_callbacks=()):
         num_nodes=1,
         strategy="auto",
         gradient_clip_val=1,
-        deterministic=True if args.deterministic else None,
     )
     try:
         trainer.fit(

@@ -59,7 +59,6 @@ python train.py --data_path library.feather --output_dir ./models --batch_size 3
 - `--max_epochs`: Maximum number of training epochs [default: 50]
 - `--resume`: Continue from `<output_dir>/resume/resume.ckpt`
 - `--checkpoint_minutes`: Minutes between resume checkpoints [default: 30]
-- `--deterministic`: Use deterministic algorithms, for exact resumes on GPU (slower)
 - `--accelerator`: Lightning accelerator: `auto`, `cpu`, `cuda` or `mps` [default: auto]
 
 **Pausing and resuming:**
@@ -73,11 +72,11 @@ python train.py --data_path library.feather --output_dir ./models --batch_size 3
 
 In the GUI, select the session in the sidebar and click **Resume training**.
 
-- Use the same `--batch_size`, `--max_epochs`, `--deterministic` and library when resuming, because they change the learning rate curve or the data. The GUI reuses the session's settings.
+- Use the same `--batch_size`, `--max_epochs` and library when resuming, because they change the learning rate curve or the data. The GUI reuses the session's settings.
 - A pause during validation exits without saving, and the resume continues from the last periodic checkpoint.
 - After a crash or `kill -9`, `--resume` continues from the last periodic checkpoint.
 - A fresh start is refused while `resume.ckpt` exists in the output directory. The `resume` folder is deleted when a run finishes.
-- A resumed run follows the same batch order, augmentation and model randomness as an uninterrupted one. On GPU, results are only repeatable with `--deterministic`, on the same GPU model, platform and PyTorch version.
+- A resumed run continues at the same batch with the same data order and augmentation. Model randomness (quantizer dropout, dropout) is not restored, so the result is not bit-identical to an uninterrupted run.
 - Lightning's warning about a non-resumable dataloader on a mid-epoch resume is expected: the sampler handles this, and Lightning's check doesn't see it.
 
 ### 2. Denoising (denoise.py)

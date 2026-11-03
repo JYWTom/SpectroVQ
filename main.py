@@ -4,6 +4,7 @@ import os
 
 import torch
 
+from utils.compile import COMPILE_MODES, compile_model
 from utils.device import ACCELERATORS, resolve_device
 from utils.formats import supported_input_extensions, supported_output_extensions
 from utils.mgfHandler.compressor import SpectrumCompressor
@@ -49,6 +50,12 @@ argparser.add_argument(
     choices=ACCELERATORS,
     help="Lightning accelerator: auto, cpu, cuda, mps",
 )
+argparser.add_argument(
+    "--compile",
+    choices=COMPILE_MODES,
+    default="none",
+    help="torch.compile the encoder and decoder (CUDA only)",
+)
 argparser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
 # %%
 arguments = argparser.parse_args()
@@ -83,6 +90,7 @@ SpectraStream = getModel.ApplyWeights(SpectraStream, weights_path)
 # Move model to the Lightning-selected device and set to evaluation mode
 SpectraStream.to(device)
 SpectraStream.eval()
+compile_model(SpectraStream, arguments.compile, device)
 
 level = int(compression_level) if compression_level is not None else None
 # Only the selected backend receives the level; the others stay None (disabled).

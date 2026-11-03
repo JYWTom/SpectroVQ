@@ -1,8 +1,11 @@
-from . import modelStream
+from typing import Any
+
 import torch
 import yaml
 
-DEFAULTPARAMS = {
+from . import modelStream
+
+DEFAULTPARAMS: dict[str, Any] = {
     "inputChannel": 1,
     "n_q": 12,
     "n_filters": 32,
@@ -37,6 +40,7 @@ def getModel(yaml_file=None):
     yaml_file (str): The path to the yaml file; if None, the default parameters are used
     weights_file (str): The path to the weights file; if None, the weights will not be loaded
     """
+    model_kwargs: dict[str, Any]
     if yaml_file is None:
         model_kwargs = DEFAULTPARAMS
 
@@ -61,7 +65,8 @@ def ApplyWeights(model, weights_file):
     weights = torch.load(weights_file, map_location="cpu")
     weights_dict = {}
     for k, v in weights["state_dict"].items():
-        new_k = k.replace("module.", "") if "module" in k else k
+        new_k = k.replace("_orig_mod.", "")  # from a torch.compile wrapper
+        new_k = new_k.replace("module.", "") if "module" in new_k else new_k
         new_k = ".".join(new_k.split(".")[1:]) if "model" in new_k else new_k
         weights_dict[new_k] = v
 

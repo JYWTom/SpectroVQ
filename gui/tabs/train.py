@@ -46,9 +46,7 @@ def _check_not_running():
         raise gr.Error("A training run is already in progress.")
 
 
-def train_run(
-    data_path, output_dir, batch_size, lr, max_epochs, num_workers, deterministic
-):
+def train_run(data_path, output_dir, batch_size, lr, max_epochs, num_workers):
     _check_not_running()
     data_path = os.path.expanduser((data_path or "").strip())
     if not data_path or not os.path.exists(data_path):
@@ -67,7 +65,6 @@ def train_run(
         "learning_rate": lr,
         "max_epochs": int(max_epochs),
         "num_workers": int(num_workers),
-        "deterministic": bool(deterministic),
     }
     # The session folder holds the record and log; checkpoints go there too unless an
     # output directory is given.
@@ -113,8 +110,6 @@ def _launch(job, params, resume=False):
         "--num_workers",
         str(params["num_workers"]),
     ]
-    if params.get("deterministic"):
-        cmd.append("--deterministic")
     if resume:
         cmd.append("--resume")
     proc = subprocess.Popen(
@@ -227,12 +222,6 @@ def build(sidebar_outputs):
                 with gr.Row():
                     ep = gr.Number(50, precision=0, label="Max epochs")
                     nw = gr.Number(4, precision=0, label="Data loader workers")
-                det = gr.Checkbox(
-                    False,
-                    label="Deterministic",
-                    info="For exact resumes on GPU. Slower; needs the same GPU model and "
-                    "PyTorch version when resuming.",
-                )
                 with gr.Row():
                     btn = gr.Button("Start training", variant="primary")
                     pause = gr.Button("Pause (save and exit)")
@@ -243,7 +232,7 @@ def build(sidebar_outputs):
                 ckpts = gr.Markdown()
         btn.click(
             with_session_list(train_run),
-            [data, out, bs, lr, ep, nw, det],
+            [data, out, bs, lr, ep, nw],
             [log, ckpts, *sidebar_outputs],
             concurrency_limit=1,
         )

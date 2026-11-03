@@ -6,6 +6,7 @@ import threading
 import gradio as gr
 
 from gui.config import read_config, save_config
+from utils.compile import COMPILE_MODES, compile_model
 from utils.device import resolve_device
 from utils.model.getModel import ApplyWeights, getModel
 
@@ -42,13 +43,26 @@ def load_model(ckpt_path, yaml_path, device):
     if yaml_path is not None and not os.path.exists(yaml_path):
         raise gr.Error(f"YAML config not found: {yaml_path}")
     device = resolve_device(device).type
-    key = (os.path.abspath(ckpt_path), os.path.getmtime(ckpt_path), yaml_path, device)
+    # Opt in with SPECTROVQ_COMPILE=default|max-autotune (CUDA only).
+    compile_mode = os.environ.get("SPECTROVQ_COMPILE", "none")
+    if compile_mode not in COMPILE_MODES:
+        raise gr.Error(
+            f"SPECTROVQ_COMPILE must be one of {', '.join(COMPILE_MODES)}, got {compile_mode!r}"
+        )
+    key = (
+        os.path.abspath(ckpt_path),
+        os.path.getmtime(ckpt_path),
+        yaml_path,
+        device,
+        compile_mode,
+    )
     with _MODEL_LOCK:
         if key not in _MODEL_CACHE:
             _MODEL_CACHE.clear()
             model = ApplyWeights(getModel(yaml_path), ckpt_path)
             model.to(device)
             model.eval()
+            compile_model(model, compile_mode, device)
             _MODEL_CACHE[key] = model
             save_config(
                 ckpt=os.path.abspath(ckpt_path),
