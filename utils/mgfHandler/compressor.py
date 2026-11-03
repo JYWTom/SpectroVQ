@@ -1,7 +1,7 @@
 from ..Compression import batchprocessor
 from ..Compression import compress
 from ..Compression import torchprocessor
-from pyteomics import mgf
+from ..formats import get_reader
 import os
 import torch
 import numpy as np
@@ -21,11 +21,11 @@ DEFAULTMGFPARAMSKEYS = [
 ]
 
 
-class MGFCompressor:
+class SpectrumCompressor:
     def __init__(
         self,
         model,
-        mgfFilePath,
+        inputFilePath,
         OutputFileName=None,
         batch_size=None,
         quantizer=6,
@@ -35,11 +35,11 @@ class MGFCompressor:
         outputOutOfRange=True,
     ):
         """
-        Initialize the MGFCompressor for compressing mass spectrometry data.
+        Initialize the SpectrumCompressor for compressing mass spectrometry data.
 
         Args:
             model: Neural network model for encoding spectra
-            mgfFilePath (str): Path to the input MGF file containing mass spectra
+            inputFilePath (str): Path to the input spectra file (any registered format, e.g. .mgf)
             OutputFileName (str, optional): Name for output files. Defaults to input filename.
             batch_size (int, optional): Number of spectra to process in each batch. Defaults to 128.
             quantizer (int): Number of quantization levels for vector quantization. Defaults to 6.
@@ -48,14 +48,14 @@ class MGFCompressor:
             outputOutOfRange (bool): Whether to include peaks outside the range of 150-1500Th. Defaults to True.
         """
         self.model = model
-        self.mgfFilePath = mgfFilePath
+        self.inputFilePath = inputFilePath
         self.OutputFileName = OutputFileName
         if self.OutputFileName is None:
-            self.OutputFileName = os.path.basename(mgfFilePath).split(".")[0]
+            self.OutputFileName = os.path.basename(inputFilePath).split(".")[0]
             Warning(
                 f"Output file name is not defined; using input name {self.OutputFileName} as output name"
             )
-        self.mgfFile = mgf.read(mgfFilePath)
+        self.reader = get_reader(inputFilePath)
         self.device = next(self.model.parameters()).device
         self.packer = compress.BitPacker(
             10,
@@ -115,18 +115,15 @@ class MGFCompressor:
     # Mode 1: Load all spectra into MEMORY, then perform compression
     def LoadAll(self, debug: bool = False):
         """
-        Load all spectra from the MGF file into memory.
+        Load all spectra from the input file into memory.
 
-        Reads all spectra from the MGF file and stores m/z arrays, intensity arrays,
+        Reads all spectra via the format reader and stores m/z arrays, intensity arrays,
         and parameters for subsequent compression. Initializes the MaxValList for tracking.
         """
-        mzList, intensityList, paramList = [], [], []
-        for i, spectrum in enumerate(self.mgfFile):
-            mzList.append(spectrum["m/z array"])
-            intensityList.append(spectrum["intensity array"])
-            paramList.append(spectrum["params"])
-            if (debug) & (i >= 9):
-                break
+        spectra = self.reader.read_all(limit=10 if debug else None)
+        mzList = [sp.mz for sp in spectra]
+        intensityList = [sp.intensity for sp in spectra]
+        paramList = [sp.params for sp in spectra]
         self.mzList = mzList
         self.intensityList = intensityList
         self.paramList = paramList
@@ -146,7 +143,7 @@ class MGFCompressor:
         """
         self.LoadAll(debug=debug)
         if verbose >= 1:
-            print(f"Loaded {len(self.mzList)} spectra from {self.mgfFilePath}")
+            print(f"Loaded {len(self.mzList)} spectra from {self.inputFilePath}")
             print(
                 f"Starting Compression with batch size {self.batch_size} and quantizer {self.quantizer}"
             )
@@ -256,3 +253,11 @@ class MGFCompressor:
                     self.model.quantizedlen
                 ):  # Number of integers in each quantizer
                     self.packer.push(output_codes[j, k, l])  # First in First out
+
+
+class MGFCompressor(SpectrumCompressor):
+    """Backwards-compatible entry point (``mgfFilePath`` keyword)."""
+
+    def __init__(self, model, mgfFilePath, *args, **kwargs):
+        super().__init__(model, mgfFilePath, *args, **kwargs)
+        self.mgfFilePath = mgfFilePath

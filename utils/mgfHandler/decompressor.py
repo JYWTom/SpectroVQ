@@ -1,7 +1,7 @@
 from utils.Compression import batchprocessor
 from utils.Compression import compress
 from utils.Compression import postprocessing
-from pyteomics import mgf
+from utils.formats import Spectrum, get_writer
 import os
 import torch
 import numpy as np
@@ -21,12 +21,12 @@ DEFAULTMGFPARAMSKEYS = [
 ]
 
 
-class MGFDecompressor:
+class SpectrumDecompressor:
     def __init__(
         self,
         model,
         inputFileName,
-        outputfilemgf=None,
+        outputFilePath=None,
         batch_size=None,
         quantizer=6,
         stored_raw=False,
@@ -35,12 +35,12 @@ class MGFDecompressor:
         zstd_compression_level=None,
     ):
         """
-        Initialize the MGFDecompressor for decompressing mass spectrometry data.
+        Initialize the SpectrumDecompressor for decompressing mass spectrometry data.
 
         Args:
             model: Neural network model for decoding spectra
             inputFileName (str): Path to the compressed input file (.vqms2 format)
-            outputfilemgf (str, optional): Path for output MGF file. Defaults to 'output.mgf'.
+            outputFilePath (str, optional): Path for output file; format chosen by extension. Defaults to 'output.mgf'.
             batch_size (int, optional): Number of spectra to process in each batch. Defaults to 128.
             quantizer (int): Number of quantization levels used during compression. Defaults to 6.
             stored_raw (bool): Whether to store raw reconstructed spectra in addition to compounded spectra. When False, only compounded spectra are stored if available.
@@ -48,14 +48,12 @@ class MGFDecompressor:
             zlib_compression_level (int): Compression level for zlib. Defaults to 6.
         """
         self.model = model
-        if outputfilemgf is None:
+        if outputFilePath is None:
             folder_path = os.path.dirname(inputFileName)
-            self.OutputFileMGF = os.path.join(folder_path, "output.mgf")
+            self.OutputFilePath = os.path.join(folder_path, "output.mgf")
         else:
-            self.OutputFileMGF = outputfilemgf
-            assert self.OutputFileMGF.endswith(".mgf"), (
-                "Output file must be in MGF format"
-            )
+            self.OutputFilePath = outputFilePath
+        self.writer = get_writer(self.OutputFilePath)  # validates the extension
         self.inputFileName = inputFileName
         self.device = next(self.model.parameters()).device
         assert os.path.exists(self.inputFileName), "Input file does not exist"
@@ -79,6 +77,7 @@ class MGFDecompressor:
         # Always process compounded spectra if available for reconstruction
         self.process_compounded = True
         self.compounded_codes_list = []
+        self.compounded_idx_list = []  # stays empty without a _compounded.pkl
         if os.path.exists(self.inputFileNameWithoutExt + "_compounded.pkl"):
             with open(self.inputFileNameWithoutExt + "_compounded.pkl", "rb") as f:
                 self.compounded_idx_list = pickle.load(f)
@@ -116,25 +115,17 @@ class MGFDecompressor:
         Format spectrum for MGF output.
 
         """
-        spectrum = {
-            "m/z array": postprocessing.changeTofloat(list(output_mz)),
-            "intensity array": np.array(list(output_intensity), np.float64),
-        }
-        spectrum.update(
-            {"params": {key: metaDataBatchrow[key] for key in metaDataBatchrow.index}}
-        )
+        params = {key: metaDataBatchrow[key] for key in metaDataBatchrow.index}
         if modify_flag:
-            spectrum["params"].update(
-                {"title": self.changeSpectrumName(metaDataBatchrow["title"])}
-            )
+            params["title"] = self.changeSpectrumName(metaDataBatchrow["title"])
         else:
-            spectrum["params"].update({"title": metaDataBatchrow["title"]})
-        spectrum["params"].update(
-            {"pepmass": (spectrum["params"]["pepmz"], spectrum["params"]["pepit"])}
+            params["title"] = metaDataBatchrow["title"]
+        params["pepmass"] = (params.pop("pepmz"), params.pop("pepit"))
+        return Spectrum(
+            mz=postprocessing.changeTofloat(list(output_mz)),
+            intensity=np.array(list(output_intensity), np.float64),
+            params=params,
         )
-        spectrum["params"].pop("pepmz")
-        spectrum["params"].pop("pepit")
-        return spectrum
 
     # Mode 1: Load All Spectra, then perform decompression
     def DecompressAll(self, verbose=0):
@@ -279,7 +270,7 @@ class MGFDecompressor:
                     ] = spectrum
                     CompoundedSpectrumDict[
                         str(batched_compounded_metadata.iloc[k]["OriginalIndex"])
-                    ]["params"].pop("OriginalIndex")
+                    ].params.pop("OriginalIndex")
         # Process other spectrum normally
         for batch_start in range(0, total_spectra, self.batch_size):
             batch_end = min(batch_start + self.batch_size, total_spectra)
@@ -335,8 +326,11 @@ class MGFDecompressor:
                 if str(batch_start + k) in CompoundedSpectrumDict.keys():
                     if verbose >= 2:
                         print(f"Spectrum {batch_start + k} is compounded")
+                    compounded = CompoundedSpectrumDict[str(batch_start + k)]
                     ListOfSpectrum.append(
-                        CompoundedSpectrumDict[str(batch_start + k)].copy()
+                        Spectrum(
+                            compounded.mz, compounded.intensity, dict(compounded.params)
+                        )
                     )
                     if self.stored_raw:
                         spectrum = self.formatMGFformat(
@@ -358,7 +352,7 @@ class MGFDecompressor:
                     ListOfSpectrum.append(spectrum)
 
         if verbose >= 1:
-            print("Starting to write spectra to MGF file.")
+            print("Starting to write spectra to output file.")
             print(f"Number of spectra: {len(ListOfSpectrum)}")
         # if verbose >=2:
         # for spec in ListOfSpectrum:
@@ -368,8 +362,16 @@ class MGFDecompressor:
             TotalListSpectrum = ListOfSpectrum + ListOfRawSpectrum
             if verbose >= 1:
                 print(f"Number of raw spectra: {len(TotalListSpectrum)}")
-            mgf.write(TotalListSpectrum, self.OutputFileMGF)
+            self.writer.write(TotalListSpectrum)
         else:
-            mgf.write(ListOfSpectrum, self.OutputFileMGF)
+            self.writer.write(ListOfSpectrum)
 
-        print(f"Decompression completed. Output written to {self.OutputFileMGF}")
+        print(f"Decompression completed. Output written to {self.OutputFilePath}")
+
+
+class MGFDecompressor(SpectrumDecompressor):
+    """Backwards-compatible entry point (``outputfilemgf`` keyword)."""
+
+    def __init__(self, model, inputFileName, outputfilemgf=None, *args, **kwargs):
+        super().__init__(model, inputFileName, outputfilemgf, *args, **kwargs)
+        self.OutputFileMGF = self.OutputFilePath
