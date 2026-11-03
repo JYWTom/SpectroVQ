@@ -4,37 +4,10 @@ import os
 import threading
 
 import gradio as gr
-import torch
 
 from gui.config import read_config, save_config
+from utils.device import resolve_device
 from utils.model.getModel import ApplyWeights, getModel
-
-
-def available_devices():
-    devices = ["auto"]
-    if torch.cuda.is_available():
-        devices.append("cuda")
-    if (
-        getattr(torch.backends, "mps", None) is not None
-        and torch.backends.mps.is_available()
-    ):
-        devices.append("mps")
-    devices.append("cpu")
-    return devices
-
-
-def resolve_device(device):
-    if device != "auto":
-        return device
-    if torch.cuda.is_available():
-        return "cuda"
-    if (
-        getattr(torch.backends, "mps", None) is not None
-        and torch.backends.mps.is_available()
-    ):
-        return "mps"
-    return "cpu"
-
 
 _MODEL_CACHE = {}
 _MODEL_LOCK = threading.Lock()
@@ -68,7 +41,7 @@ def load_model(ckpt_path, yaml_path, device):
         raise gr.Error(f"Checkpoint not found: {ckpt_path}")
     if yaml_path is not None and not os.path.exists(yaml_path):
         raise gr.Error(f"YAML config not found: {yaml_path}")
-    device = resolve_device(device)
+    device = resolve_device(device).type
     key = (os.path.abspath(ckpt_path), os.path.getmtime(ckpt_path), yaml_path, device)
     with _MODEL_LOCK:
         if key not in _MODEL_CACHE:
@@ -94,6 +67,6 @@ def model_status(ckpt_path, yaml_path, device):
     n_q = model.n_q
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
     return (
-        f"✅ Loaded on **{resolve_device(device)}** · {n_params:.1f}M parameters · "
+        f"✅ Loaded on **{resolve_device(device).type}** · {n_params:.1f}M parameters · "
         f"{n_q} quantizers · {model.quantizedlen} codes per quantizer per spectrum"
     )

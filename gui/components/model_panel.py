@@ -4,12 +4,12 @@ import gradio as gr
 
 from gui.components.file_picker import host_file_picker
 from gui.model import (
-    available_devices,
     initial_ckpt,
     initial_model_status,
     initial_yaml,
     model_status,
 )
+from utils.device import available_accelerators
 
 
 def build():
@@ -31,7 +31,9 @@ def build():
                     value=initial_yaml,
                 )
             with gr.Column(scale=1):
-                device = gr.Dropdown(available_devices(), value="auto", label="Device")
+                device = gr.Dropdown(
+                    available_accelerators(), value="auto", label="Device"
+                )
                 load_btn = gr.Button("Load model")
         status = gr.Markdown(initial_model_status)  # re-run on every page load
         load_btn.click(model_status, [ckpt, yaml_cfg, device], status)

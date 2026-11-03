@@ -384,6 +384,8 @@ class TransformerBlock(nn.Module):
 
 
 class Transformer(nn.Module):
+    freqs_cis: torch.Tensor  # non-persistent buffer
+
     def __init__(self, params: ModelArgs):
         """
         Initialize a Transformer model.
@@ -420,11 +422,15 @@ class Transformer(nn.Module):
         #     params.dim, params.vocab_size, bias=False, init_method=lambda x: x
         # )
 
-        self.freqs_cis = precompute_freqs_cis(
-            # Note that self.params.max_seq_len is multiplied by 2 because the token limit for the Llama 2 generation of models is 4096.
-            # Adding this multiplier instead of using 4096 directly allows for dynamism of token lengths while training or fine-tuning.
-            self.params.dim // self.params.n_heads,
-            self.params.max_seq_len * 2,
+        self.register_buffer(
+            "freqs_cis",
+            precompute_freqs_cis(
+                # Note that self.params.max_seq_len is multiplied by 2 because the token limit for the Llama 2 generation of models is 4096.
+                # Adding this multiplier instead of using 4096 directly allows for dynamism of token lengths while training or fine-tuning.
+                self.params.dim // self.params.n_heads,
+                self.params.max_seq_len * 2,
+            ),
+            persistent=False,
         )
 
     def forward(self, tokens: torch.Tensor):
@@ -443,7 +449,6 @@ class Transformer(nn.Module):
         tokens = tokens.permute(0, 2, 1)
         _bsz, seqlen, channel = tokens.shape
         # h = self.tok_embeddings(tokens)
-        self.freqs_cis = self.freqs_cis.to(tokens.device)
         freqs_cis = self.freqs_cis[:seqlen]
         h = tokens
         # mask = None

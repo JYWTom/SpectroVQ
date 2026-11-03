@@ -10,6 +10,7 @@ import lightning as L
 import numpy as np
 import pandas as pd
 import torch
+from lightning.fabric.accelerators import CUDAAccelerator
 from lightning.pytorch import seed_everything
 from lightning.pytorch.callbacks import Callback, ModelCheckpoint
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
@@ -611,11 +612,8 @@ def main(argv=None, extra_callbacks=()):
     seed_everything(BASE_SEED, workers=True)
     torch.set_float32_matmul_precision("high")
 
-    if torch.cuda.is_available():
-        print("CUDA is available!")
+    if CUDAAccelerator.is_available():
         torch.backends.cudnn.benchmark = True
-    else:
-        print("CUDA is not available.")
 
     print("Starting Training Program")
 
@@ -623,7 +621,6 @@ def main(argv=None, extra_callbacks=()):
     SpectraStream = modelStream.SpectroVQ(**model_kwargs2)
     learning_rate = args.learning_rate
     batch_size = args.batch_size
-    torch.cuda.empty_cache()
     print("Preprocessing Training Data")
     traindata, testdata = PreprocessData(args.data_path)
     print("Creating Training Data Loaders")

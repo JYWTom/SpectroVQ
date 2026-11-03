@@ -298,11 +298,11 @@ class SpectroVQ(nn.Module):
             else:
                 quantized = x
                 BeforeQuantization = None
-                out_losses = torch.tensor(0.0)
+                out_losses = x.new_zeros(())
         else:
             quantized = x
             BeforeQuantization = None
-            out_losses = torch.tensor(0.0)
+            out_losses = x.new_zeros(())
         x = self.decoder(quantized, FiLM_input)
         if x.shape[2] != input.shape[2]:
             x = x[:, :, : input.shape[2]]

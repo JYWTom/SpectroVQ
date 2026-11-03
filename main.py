@@ -4,6 +4,7 @@ import os
 
 import torch
 
+from utils.device import ACCELERATORS, resolve_device
 from utils.formats import supported_input_extensions, supported_output_extensions
 from utils.mgfHandler.compressor import SpectrumCompressor
 from utils.mgfHandler.decompressor import SpectrumDecompressor
@@ -41,6 +42,13 @@ argparser.add_argument(
 argparser.add_argument(
     "--stored_raw", "-sR", action="store_true", help="Store raw reconstructed spectra"
 )
+argparser.add_argument(
+    "--accelerator",
+    type=str,
+    default="auto",
+    choices=ACCELERATORS,
+    help="Lightning accelerator: auto, cpu, cuda, mps",
+)
 argparser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
 # %%
 arguments = argparser.parse_args()
@@ -54,6 +62,7 @@ compression_level = arguments.compression_level
 batch_size = arguments.batch_size
 stored_raw = arguments.stored_raw
 verbose = arguments.verbose
+device = resolve_device(arguments.accelerator)
 
 # Double check the input
 if input_file_path is None:
@@ -65,13 +74,14 @@ if weights_path is None:
 
 
 # Load
-torch.backends.cudnn.benchmark = True
+if device.type == "cuda":
+    torch.backends.cudnn.benchmark = True
 # Load the neural network model for spectrum processing
 SpectraStream = getModel.getModel()
 # Apply pre-trained weights to the model
 SpectraStream = getModel.ApplyWeights(SpectraStream, weights_path)
-# Move model to GPU and set to evaluation mode
-SpectraStream.to("cuda")
+# Move model to the Lightning-selected device and set to evaluation mode
+SpectraStream.to(device)
 SpectraStream.eval()
 
 level = int(compression_level) if compression_level is not None else None
