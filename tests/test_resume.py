@@ -28,6 +28,7 @@ FINAL = "final.ckpt"
 def _driver():
     """Run train.main() with the callback described by the SVQ_HOOKS environment variable."""
     import lightning as L
+
     import train
 
     hooks = json.loads(os.environ.get("SVQ_HOOKS", "{}"))
@@ -86,10 +87,10 @@ if __name__ == "__main__":
     sys.exit(0)
 
 
-import numpy as np  # noqa: E402
-import pandas as pd  # noqa: E402
-import pytest  # noqa: E402
-import torch  # noqa: E402
+import numpy as np
+import pandas as pd
+import pytest
+import torch
 
 
 def _library(path, rows=22):
@@ -140,6 +141,7 @@ class Run:
     def __call__(self, *extra, hooks=None, expect=0, script=__file__):
         p = subprocess.run(
             [sys.executable, "-u", str(script), *self.args, *extra],
+            check=False,  # the exit code is asserted below
             cwd=self.dir,
             env=self.env(hooks),
             capture_output=True,
@@ -147,7 +149,9 @@ class Run:
             timeout=300,
         )
         out = p.stdout + p.stderr
-        assert p.returncode == expect, f"exit {p.returncode}, wanted {expect}\n{out[-4000:]}"
+        assert p.returncode == expect, (
+            f"exit {p.returncode}, wanted {expect}\n{out[-4000:]}"
+        )
         return out
 
     def final(self):
@@ -162,7 +166,9 @@ def _diffs(a, b, path=""):
     if isinstance(a, (list, tuple)):
         if len(a) != len(b):
             return [f"{path}: lengths differ"]
-        return [d for i, (x, y) in enumerate(zip(a, b)) for d in _diffs(x, y, f"{path}/{i}")]
+        return [
+            d for i, (x, y) in enumerate(zip(a, b)) for d in _diffs(x, y, f"{path}/{i}")
+        ]
     if torch.is_tensor(a):
         return [] if torch.equal(a, b) else [path]
     return [] if a == b else [f"{path}: {a} != {b}"]
@@ -257,7 +263,9 @@ def test_exact_after_two_pauses_in_one_epoch(library, baselines, folder, workers
 
 
 def test_workers_do_not_change_the_result(baselines):
-    assert not _diffs(baselines(0).final()["state_dict"], baselines(2).final()["state_dict"])
+    assert not _diffs(
+        baselines(0).final()["state_dict"], baselines(2).final()["state_dict"]
+    )
 
 
 # 2. Pause mechanics, on plain train.py with a signal from outside
@@ -273,6 +281,7 @@ def test_external_sigterm(library, folder):
         stderr=subprocess.STDOUT,
         text=True,
     )
+    assert p.stdout is not None  # started with stdout=PIPE
     lines = []
     for line in p.stdout:
         lines.append(line)
@@ -321,9 +330,13 @@ def test_pause_during_validation(library, baselines, folder):
     final = run.final()
     assert_same_end(run, base.final())
     key = "current_score"
-    a = next(v for k, v in final["callbacks"].items() if "val_mean_loss" in k and key in v)
+    a = next(
+        v for k, v in final["callbacks"].items() if "val_mean_loss" in k and key in v
+    )
     b = next(
-        v for k, v in base.final()["callbacks"].items() if "val_mean_loss" in k and key in v
+        v
+        for k, v in base.final()["callbacks"].items()
+        if "val_mean_loss" in k and key in v
     )
     assert torch.equal(a[key], b[key]), "val_mean_loss differs"
 
@@ -334,9 +347,13 @@ def test_pause_during_validation(library, baselines, folder):
 @pytest.mark.parametrize(
     "hooks",
     [
-        pytest.param({"sigterm": [[0, BATCHES - 1]]}, id="last-batch-no-validation-next"),
+        pytest.param(
+            {"sigterm": [[0, BATCHES - 1]]}, id="last-batch-no-validation-next"
+        ),
         pytest.param({"sigterm": [[1, BATCHES - 1]]}, id="last-batch-validation-next"),
-        pytest.param({"sigterm": [[2, BATCHES - 1]]}, id="last-batch-of-validation-epoch"),
+        pytest.param(
+            {"sigterm": [[2, BATCHES - 1]]}, id="last-batch-of-validation-epoch"
+        ),
         pytest.param({"sigterm_epoch_end": [[0]]}, id="in-epoch-end-hook"),
     ],
 )
@@ -424,7 +441,9 @@ def test_apply_weights_loads_resume_checkpoint(library, folder):
 
     run = Run(library, folder)
     run(hooks={"sigterm": [[0, 3]]}, expect=75)
-    rng = _callback(torch.load(run.resume_ckpt, weights_only=False), "ResumeState")["rng"]
+    rng = _callback(torch.load(run.resume_ckpt, weights_only=False), "ResumeState")[
+        "rng"
+    ]
     assert rng["module_rng"]["state"]["state"] > 2**64, "not a big-int numpy state"
     model = ApplyWeights(getModel(), str(run.resume_ckpt))  # default torch.load
     assert sum(p.numel() for p in model.parameters()) > 0

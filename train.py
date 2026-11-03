@@ -1,25 +1,26 @@
-import torch
-import pandas as pd
+import argparse
+import math
 import os
 import shutil
 import sys
 from datetime import timedelta
-import numpy as np
-import math
-from torch.utils.data import Dataset, DataLoader, Sampler
-from utils.SpectrumProcessing.SpectraLoading import massSpectrumToVector
-import torch
-import torch.nn as nn
+from typing import Any
+
 import lightning as L
-from lightning.pytorch import seed_everything
 import numpy as np
-import argparse
-from utils.model import modelStream
-from lightning.pytorch.callbacks.early_stopping import EarlyStopping
+import pandas as pd
+import torch
+from lightning.pytorch import seed_everything
 from lightning.pytorch.callbacks import Callback, ModelCheckpoint
+from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 from lightning.pytorch.utilities.exceptions import SIGTERMException
+from torch import nn
 from torch.optim import AdamW
+from torch.utils.data import DataLoader, Dataset, Sampler
 from transformers import get_cosine_schedule_with_warmup
+
+from utils.model import modelStream
+from utils.SpectrumProcessing.SpectraLoading import massSpectrumToVector
 
 
 def find0arr(arr):
@@ -161,19 +162,19 @@ class SpectrumBatch(Dataset):
     def __len__(self):
         return self.length
 
-    def __getitem__(self, idx):
+    def __getitem__(self, index):
         # Per sample, so a sample's augmentation doesn't depend on which worker loads it or
         # on what was loaded before it, and a resumed epoch can start anywhere.
-        rng = np.random.default_rng([self.base_seed, self.epoch, idx])
-        mz, it = self.Xmz.iloc[idx], self.Xintensity.iloc[idx]
-        precursormz = self.PrecursorMz.iloc[idx]
+        rng = np.random.default_rng([self.base_seed, self.epoch, index])
+        mz, it = self.Xmz.iloc[index], self.Xintensity.iloc[index]
+        precursormz = self.PrecursorMz.iloc[index]
         # Peak Masking
         delete_mask = rng.binomial(1, 0.1, size=len(mz))
         mz = mz[delete_mask == 0]
         it = it[delete_mask == 0]
         spectra, _ = massSpectrumToVector(
-            self.Xmz.iloc[idx],
-            self.Xintensity.iloc[idx],
+            self.Xmz.iloc[index],
+            self.Xintensity.iloc[index],
             bin_size=Bin_size,
             SPECTRA_DIMENSION=13500,
             rawIT=False,
@@ -213,7 +214,7 @@ class SpectrumBatch(Dataset):
             )  # 5 Th Tolerance
             mixupidx = np.argmin(np.abs(self.PrecursorMz - mixupMz))
             N = 0
-            while mixupidx == idx:
+            while mixupidx == index:
                 mixupMz = rng.uniform(
                     currentPrecursorMz - 5, currentPrecursorMz + 5
                 )  # 5 Th Tolerance
@@ -265,7 +266,8 @@ class ResumableSampler(Sampler):
         return iter(order[skip * self.batch_size :])
 
     def __len__(self):
-        return len(self.dataset)  # the full epoch, so Lightning's batch count stays stable
+        # The full epoch, so Lightning's batch count stays stable.
+        return len(self.dataset)
 
 
 eps = 1e-6
@@ -353,20 +355,20 @@ class LightningModelSpectraStream(L.LightningModule):
 
         if batch_idx % 5000 == 0:
             print(".", end="")
-            print("Training Loss: {}".format(loss.item()))
-            print("SpectralConstrastiveLoss: {}".format(OrigCosineLoss.item()))
-            print("QuantizeLoss: {}".format(QuantizeLoss.item()))
-            print("SELoss: {}".format(SE_Loss.item()))
+            print(f"Training Loss: {loss.item()}")
+            print(f"SpectralConstrastiveLoss: {OrigCosineLoss.item()}")
+            print(f"QuantizeLoss: {QuantizeLoss.item()}")
+            print(f"SELoss: {SE_Loss.item()}")
 
         if torch.isnan(loss):
-            print("NAN Loss Detected at Training batch {}".format(batch_idx))
+            print(f"NAN Loss Detected at Training batch {batch_idx}")
         else:
             self.AverageTrainingLoss.append(loss.item())
         return loss
 
     def validation_step(self, batch, batch_idx):
 
-        spectra, aug_spectra = batch
+        spectra, _ = batch
 
         output, _, _ = self.model(spectra)
 
@@ -377,12 +379,12 @@ class LightningModelSpectraStream(L.LightningModule):
         loss = OrigCosineLoss + SE_Loss
 
         if batch_idx % 100 == 0:
-            print("Testing Loss: {}".format(loss.item()))
-            print("SpectralConstrastiveLoss: {}".format(OrigCosineLoss.item()))
-            print("SELoss: {}".format(SE_Loss.item()))
+            print(f"Testing Loss: {loss.item()}")
+            print(f"SpectralConstrastiveLoss: {OrigCosineLoss.item()}")
+            print(f"SELoss: {SE_Loss.item()}")
 
         if torch.isnan(loss):
-            print("NAN Loss Detected at Testing batch {}".format(batch_idx))
+            print(f"NAN Loss Detected at Testing batch {batch_idx}")
         else:
             self.AverageTestLossList.append(loss.item())
         self.log("val_loss", loss, sync_dist=True, on_epoch=True)
@@ -390,14 +392,14 @@ class LightningModelSpectraStream(L.LightningModule):
     def on_train_epoch_end(self):
         self.AverageTrainingLoss.clear()
         self.rng = np.random.default_rng(42 + self.rng.integers(0, 1000))
-        return
 
     def on_validation_epoch_end(self):
         AverageTLoss = np.mean(self.AverageTestLossList)
         self.log("val_mean_loss", AverageTLoss, sync_dist=True)
         self.AverageTestLossList.clear()
-        self.trainer.val_dataloaders.dataset.epoch += 1
-        return
+        val_loader = self.trainer.val_dataloaders
+        assert val_loader is not None  # this hook only runs when validating
+        val_loader.dataset.epoch += 1
 
     def configure_optimizers(self):
         warmup_epochs = 7
@@ -425,10 +427,14 @@ class ResumeState(Callback):
     the default torch.load.
     """
 
+    # Set in setup(), which Lightning calls before any checkpoint is saved.
+    trainer: L.Trainer
+    module: LightningModelSpectraStream
+
     def __init__(self, sampler, val_dataset):
         self.sampler, self.val_dataset = sampler, val_dataset
         self.batches_done = 0  # finished this epoch
-        self.trainer = self.module = self._rng_to_restore = None
+        self._rng_to_restore = None
         self._should_stop = False
 
     def setup(self, trainer, pl_module, stage):
@@ -456,7 +462,9 @@ class ResumeState(Callback):
         for name, gen in self._generators().items():
             rng[name] = gen.bit_generator.state
         return {
-            "epoch": self.trainer.fit_loop.epoch_progress.current.processed,
+            # What Lightning passes to set_epoch, not current_epoch (which reads `completed`).
+            # A _ProcessedTracker at runtime; Lightning declares the narrower base type.
+            "epoch": self.trainer.fit_loop.epoch_progress.current.processed,  # ty: ignore[unresolved-attribute]
             "batches_done": self.batches_done,
             "val_epoch": self.val_dataset.epoch,
             "should_stop": bool(self.trainer.should_stop),
@@ -502,7 +510,7 @@ class ResumeCheckpoint(ModelCheckpoint):
             super().on_exception(trainer, pl_module, exception)
 
 
-model_kwargs2 = {
+model_kwargs2: dict[str, Any] = {
     "inputChannel": 1,
     "n_q": 12,
     "n_filters": 32,
@@ -605,11 +613,9 @@ def main(argv=None, extra_callbacks=()):
 
     if torch.cuda.is_available():
         print("CUDA is available!")
-        device = torch.device("cuda")
         torch.backends.cudnn.benchmark = True
     else:
         print("CUDA is not available.")
-        device = torch.device("cpu")
 
     print("Starting Training Program")
 
