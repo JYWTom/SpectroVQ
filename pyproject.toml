@@ -1,0 +1,43 @@
+[project]
+name = "spectrovq"
+version = "0.1.0"
+description = "Vector-quantized compression and denoising of mass spectrometry data"
+readme = "README.md"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = [
+    # PyTorch is left unpinned. The default PyPI wheel is used; for a specific
+    # CUDA build, point uv at the matching PyTorch index (see README).
+    "torch",
+    "einops>=0.8.2",
+    "gradio>=6.29.1",
+    "lightning>=2.6.1",
+    "matplotlib>=3.10.8",
+    "numpy>=2.3.5",
+    "pandas>=3.0.1",
+    "pyarrow>=23.0.1",
+    "pyteomics>=4.7.5",
+    # mzML parsing (pyteomics.mzml)
+    "lxml>=6.1.3",
+    "psims>=1.4.0",
+    "pyyaml>=6.0.3",
+    "scikit-learn>=1.8.0",
+    "tqdm>=4.67.3",
+    "transformers>=5.2.0",
+    "zstandard>=0.23.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "ruff",
+]
+
+[tool.uv]
+# Scripts at the repo root (main.py, gui.py, train.py, ...), not an installable package.
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Repo-root scripts/packages (utils, gui) are imported directly, not installed.
+pythonpath = ["."]

@@ -1,5 +1,5 @@
 # Importing a format module registers it.
-from . import mgf  # noqa: F401
+from . import mgf, mzml  # noqa: F401
 from .base import Spectrum, SpectrumReader, SpectrumWriter
 from .registry import (
     get_reader,
