@@ -1,5 +1,5 @@
 # SpectroVQ
-SpectroVQ: Noise-Aware Compression of Proteomics Data via Vector-Quantized Deep Learning improves MS/MS data storage and Peptide Identification publications: TBH
+SpectroVQ: Noise-Aware Compression of Proteomics Data via Vector-Quantized Deep Learning improves MS/MS data storage and Peptide Identification ![link](https://www.biorxiv.org/content/10.64898/2026.09.05.749393v1.full)
 
 ![](https://github.com/kenll99minecart/SpectroVQ/blob/main/Figure1Final_v2.png)
 
@@ -17,22 +17,26 @@ A demo version of SpectroVQ is available in  https://huggingface.co/spaces/kenll
 
 ### Prerequisites
 - Python 3.11+
+- [uv](https://docs.astral.sh/uv/) package manager
 - CUDA-compatible GPU (recommended for training and inference)
-- Conda environment manager
 
-### Step 1: Create Conda Environment
+### Install
+Dependencies are declared in `pyproject.toml` and locked in `uv.lock`. From the repository root:
 ```bash
-conda create -n spectrovq python=3.11
-conda activate spectrovq
+uv sync
 ```
+This creates `.venv` with the locked dependencies (including the `dev` group: pytest, ruff). Run commands with `uv run`, e.g. `uv run python main.py ...` or `uv run pytest`, or activate `.venv` and use `python` directly as in the examples below.
 
-### Step 2: Install PyTorch
-**IMPORTANT**: Install PyTorch based on your CUDA version first. Check your CUDA version with `nvidia-smi`.
-Check the pytorch official website for more.
+### PyTorch and CUDA
+`uv sync` installs the default PyPI build of PyTorch. If you need a specific CUDA build, check your CUDA version with `nvidia-smi` and point uv at the matching PyTorch index by adding this to `pyproject.toml` (shown for CUDA 12.8; see the [PyTorch install guide](https://pytorch.org/get-started/locally/) for other versions), then run `uv sync` again:
+```toml
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
 
-### Step 3: Install Dependencies
-```bash
-pip install -r requirements.txt
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
 ```
 
 ## Usage
