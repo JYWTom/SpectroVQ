@@ -1,19 +1,28 @@
 # %%
-from utils.mgfHandler.compressor import MGFCompressor
-from utils.mgfHandler.decompressor import MGFDecompressor
-from utils.model import getModel
-import os
-import torch
 import argparse
 import os
 
+import torch
+
+from utils.formats import supported_input_extensions, supported_output_extensions
+from utils.mgfHandler.compressor import SpectrumCompressor
+from utils.mgfHandler.decompressor import SpectrumDecompressor
+from utils.model import getModel
+
 # Set up command line argument parser for compression/decompression modes
-argparser = argparse.ArgumentParser(description="Compress or Decompress MGF files")
+argparser = argparse.ArgumentParser(
+    description="Compress or Decompress mass spectrometry files"
+)
 argparser.add_argument("--compress", "-m", action="store_true", help="Mode: Compress")
 argparser.add_argument(
     "--decompress", "-d", action="store_true", help="Mode: Decompress"
 )
-argparser.add_argument("--input", "-i", type=str, help="Input MGF filePath")
+argparser.add_argument(
+    "--input",
+    "-i",
+    type=str,
+    help="Input file path (.mgf, or .vqms2 when decompressing)",
+)
 argparser.add_argument("--output", "-o", type=str, help="Output file name")
 argparser.add_argument("--weights", "-w", type=str, help="Path to model weights")
 argparser.add_argument(
@@ -66,114 +75,55 @@ SpectraStream.to("cuda")
 SpectraStream.eval()
 
 level = int(compression_level) if compression_level is not None else None
+# Only the selected backend receives the level; the others stay None (disabled).
+codec_levels = {
+    "gzip_compression_level": None,
+    "zlib_compression_level": None,
+    "zstd_compression_level": None,
+}
+if compression_method in ("gzip", "zlib", "zstd"):
+    codec_levels[f"{compression_method}_compression_level"] = level
+
 if compress + decompress > 1:
     raise ValueError("Mode must be either compress or decompress, not both")
 elif compress:
-    if not input_file_path.endswith(".mgf"):
-        raise ValueError("Input file must be a MGF file")
-    if compression_method == "gzip":
-        mgfcompressor = MGFCompressor(
-            mgfFilePath=input_file_path,
-            OutputFileName=output_file_path,
-            model=SpectraStream,
-            batch_size=batch_size,
-            quantizer=4,
-            gzip_compression_level=level,
-            zlib_compression_level=None,
-            zstd_compression_level=None,
+    if os.path.splitext(input_file_path)[1].lower() not in supported_input_extensions():
+        raise ValueError(
+            f"Input file must be one of: {', '.join(supported_input_extensions())}"
         )
-    elif compression_method == "zlib":
-        mgfcompressor = MGFCompressor(
-            mgfFilePath=input_file_path,
-            OutputFileName=output_file_path,
-            model=SpectraStream,
-            batch_size=batch_size,
-            quantizer=4,
-            gzip_compression_level=None,
-            zlib_compression_level=level,
-            zstd_compression_level=None,
-        )
-    elif compression_method == "zstd":
-        mgfcompressor = MGFCompressor(
-            mgfFilePath=input_file_path,
-            OutputFileName=output_file_path,
-            model=SpectraStream,
-            batch_size=batch_size,
-            quantizer=4,
-            gzip_compression_level=None,
-            zlib_compression_level=None,
-            zstd_compression_level=level,
-        )
-    else:
-        mgfcompressor = MGFCompressor(
-            mgfFilePath=input_file_path,
-            OutputFileName=output_file_path,
-            model=SpectraStream,
-            batch_size=batch_size,
-            quantizer=4,
-            gzip_compression_level=None,
-            zlib_compression_level=None,
-            zstd_compression_level=None,
-        )
+    compressor = SpectrumCompressor(
+        inputFilePath=input_file_path,
+        OutputFileName=output_file_path,
+        model=SpectraStream,
+        batch_size=batch_size,
+        quantizer=4,
+        **codec_levels,
+    )
     if verbose:
         print("Compressing...")
     verboseInt = 2 if verbose else 0
-    mgfcompressor.CompressAll(verbose=verboseInt, debug=False)
+    compressor.CompressAll(verbose=verboseInt, debug=False)
 elif decompress:
     if not input_file_path.endswith(".vqms2"):
         raise ValueError("Input file must be a .vqms2")
-    if not output_file_path.endswith(".mgf"):
-        raise ValueError("Output file must be a MGF file")
-    if compression_method == "gzip":
-        mgfcompressor = MGFDecompressor(
-            inputFileName=input_file_path,
-            outputfilemgf=output_file_path,
-            model=SpectraStream,
-            batch_size=batch_size,
-            quantizer=4,
-            stored_raw=stored_raw,
-            gzip_compression_level=level,
-            zlib_compression_level=None,
-            zstd_compression_level=None,
+    if (
+        os.path.splitext(output_file_path)[1].lower()
+        not in supported_output_extensions()
+    ):
+        raise ValueError(
+            f"Output file must be one of: {', '.join(supported_output_extensions())}"
         )
-    elif compression_method == "zlib":
-        mgfcompressor = MGFDecompressor(
-            inputFileName=input_file_path,
-            outputfilemgf=output_file_path,
-            model=SpectraStream,
-            batch_size=batch_size,
-            quantizer=4,
-            stored_raw=stored_raw,
-            gzip_compression_level=None,
-            zlib_compression_level=level,
-            zstd_compression_level=None,
-        )
-    elif compression_method == "zstd":
-        mgfcompressor = MGFDecompressor(
-            inputFileName=input_file_path,
-            outputfilemgf=output_file_path,
-            model=SpectraStream,
-            batch_size=batch_size,
-            quantizer=4,
-            stored_raw=stored_raw,
-            gzip_compression_level=None,
-            zlib_compression_level=None,
-            zstd_compression_level=level,
-        )
-    else:
-        mgfcompressor = MGFDecompressor(
-            inputFileName=input_file_path,
-            outputfilemgf=output_file_path,
-            model=SpectraStream,
-            batch_size=batch_size,
-            quantizer=4,
-            stored_raw=stored_raw,
-            gzip_compression_level=None,
-            zlib_compression_level=None,
-            zstd_compression_level=None,
-        )
+    decompressor = SpectrumDecompressor(
+        inputFileName=input_file_path,
+        outputFilePath=output_file_path,
+        model=SpectraStream,
+        batch_size=batch_size,
+        quantizer=4,
+        stored_raw=stored_raw,
+        **codec_levels,
+    )
     if verbose:
         print("Decompressing...")
     verboseInt = 2 if verbose else 0
-    mgfcompressor.DecompressAll(verbose=verboseInt)
+    decompressor.DecompressAll(verbose=verboseInt)
 # %%
