@@ -1,11 +1,16 @@
 """Spectrum binning, reconstruction and plotting helpers."""
 
+import os
+import re
+from functools import lru_cache
+
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from pyteomics import mgf, mzml
 
 from gui.config import BIN_SIZE, MZ_RANGE, SPECTRA_DIMENSION
 from utils.Compression.preprocessing import rescaleSpectra
@@ -97,7 +102,54 @@ def spectrum_title(spec, i):
     return str(params.get("title", f"spectrum {i}"))
 
 
+_MZML_SPECTRUM_ID = re.compile(r'<spectrum\s[^>]*?\bid="([^"]*)"')
+_MZML_MS_LEVEL = re.compile(r'accession="MS:1000511"[^>]*?\bvalue="(\d+)"')
+
+
+def is_mzml(path):
+    return os.path.splitext(path)[1].lower() == ".mzml"
+
+
+@lru_cache(maxsize=4)
+def _mzml_ms2_ids(path, _mtime):
+    """Ids of the MS2 spectra of an mzML. Only MS2 is supported, so MS1 scans are not offered."""
+    ids, current = [], None
+    with open(path, errors="ignore") as f:
+        for line in f:
+            if "<spectrum " in line:
+                match = _MZML_SPECTRUM_ID.search(line)
+                current = match.group(1) if match else None
+            elif current is not None and "MS:1000511" in line:
+                match = _MZML_MS_LEVEL.search(line)
+                if match and int(match.group(1)) == 2:
+                    ids.append(current)
+                current = None
+            elif "<chromatogramList" in line:
+                break
+    return ids
+
+
+def mzml_ms2_ids(path):
+    return _mzml_ms2_ids(path, os.path.getmtime(path))
+
+
+def read_spectrum(path, i):
+    """Spectrum i of an MGF or the MS2 scans of an mzML, as (m/z, intensity, title)."""
+    if is_mzml(path):
+        ids = mzml_ms2_ids(path)
+        spectrum_id = ids[min(i, len(ids) - 1)]
+        with mzml.PreIndexedMzML(path) as reader:
+            spec = reader.get_by_id(spectrum_id)
+        return spec["m/z array"], spec["intensity array"], spectrum_id
+    with mgf.IndexedMGF(path) as reader:
+        i = min(i, len(reader) - 1)
+        spec = reader[i]
+    return spec["m/z array"], spec["intensity array"], spectrum_title(spec, i)
+
+
 def count_spectra(path):
+    if is_mzml(path):
+        return len(mzml_ms2_ids(path))
     n = 0
     with open(path, "r", errors="ignore") as f:
         for line in f:

@@ -23,9 +23,14 @@ argparser.add_argument(
     "--input",
     "-i",
     type=str,
-    help="Input file path (.mgf, or .vqms2 when decompressing)",
+    help="Input file path (.mgf or .mzML, or .vqms2 when decompressing)",
 )
-argparser.add_argument("--output", "-o", type=str, help="Output file name")
+argparser.add_argument(
+    "--output",
+    "-o",
+    type=str,
+    help="Output file name (.mgf or .mzML when decompressing; .mzML needs an archive compressed from mzML)",
+)
 argparser.add_argument("--weights", "-w", type=str, help="Path to model weights")
 argparser.add_argument(
     "--compression_method",
@@ -38,7 +43,11 @@ argparser.add_argument(
     "--batch_size", "-b", type=int, help="Batch size for compression"
 )
 argparser.add_argument(
-    "--quantizer", "-q", type=int, help="Quantizer level for compression"
+    "--quantizer",
+    "-q",
+    type=int,
+    default=4,
+    help="Number of quantizers; must match between compression and decompression (default: 4)",
 )
 argparser.add_argument(
     "--stored_raw", "-sR", action="store_true", help="Store raw reconstructed spectra"
@@ -111,10 +120,11 @@ elif compress:
         )
     compressor = SpectrumCompressor(
         inputFilePath=input_file_path,
-        OutputFileName=output_file_path,
+        # The compressor appends its own extensions, so "x.vqms2" must not become "x.vqms2.vqms2".
+        OutputFileName=output_file_path.removesuffix(".vqms2"),
         model=SpectraStream,
         batch_size=batch_size,
-        quantizer=4,
+        quantizer=arguments.quantizer,
         **codec_levels,
     )
     if verbose:
@@ -136,7 +146,7 @@ elif decompress:
         outputFilePath=output_file_path,
         model=SpectraStream,
         batch_size=batch_size,
-        quantizer=4,
+        quantizer=arguments.quantizer,
         stored_raw=stored_raw,
         **codec_levels,
     )

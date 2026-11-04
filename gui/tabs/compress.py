@@ -1,4 +1,4 @@
-"""Compress tab: MGF -> .vqms2 + .parquet (+ _compounded.pkl) (MGFCompressor)."""
+"""Compress tab: MGF or mzML -> .vqms2 + .parquet (+ _compounded.pkl) (MGFCompressor)."""
 
 import os
 from pathlib import Path
@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import gradio as gr
 
-from gui.components.file_picker import host_file_picker
+from gui.components.file_picker import SPECTRA_GLOB, host_file_picker
 from gui.jobs import new_job_dir, run_logged
 from gui.model import load_model
 from gui.paths import export_dir, host_path, human_size
@@ -25,9 +25,9 @@ def compression_levels(method, level):
 
 
 def compress_run(
-    mgf_file, out_dir, n_q, method, level, batch_size, ckpt, yaml_path, device
+    spectra_file, out_dir, n_q, method, level, batch_size, ckpt, yaml_path, device
 ):
-    in_path = host_path(mgf_file, "MGF file")
+    in_path = host_path(spectra_file, "MGF or mzML file")
     model = load_model(ckpt, yaml_path, device)
     out_dir = export_dir(out_dir)
     if out_dir is not None:
@@ -96,14 +96,20 @@ def build(model_inputs, sidebar_outputs):
     with gr.Tab("Compress", id="compress"):
         with gr.Row():
             with gr.Column(scale=1):
-                file, _ = host_file_picker("Input MGF path on the server", "*.mgf")
+                file, _ = host_file_picker(
+                    "Input MGF or mzML path on the server", SPECTRA_GLOB
+                )
+                gr.Markdown(
+                    "Only MS2 spectra are compressed. An mzML keeps its metadata, so it can be "
+                    "restored to mzML later."
+                )
                 q = gr.Slider(
                     1,
                     12,
                     value=4,
                     step=1,
                     label="Quantizers",
-                    info="Must match at decompression (CLI uses 4)",
+                    info="Must match at decompression (CLI default: 4)",
                 )
                 with gr.Row():
                     method = gr.Dropdown(
