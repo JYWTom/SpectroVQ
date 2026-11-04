@@ -15,8 +15,10 @@ from gui.sessions import (
     list_sessions,
     refresh_sessions,
     session_view,
+    with_session_list,
 )
 from gui.tabs.explore import explore_load
+from gui.tabs.train import train_resume
 
 
 def build():
@@ -41,6 +43,7 @@ def build():
             to_explore=gr.Button("Open output in Explore", size="sm", visible=False),
             to_decompress=gr.Button("Send to Decompress", size="sm", visible=False),
             to_ckpt=gr.Button("Use as model checkpoint", size="sm", visible=False),
+            to_resume=gr.Button("Resume training", size="sm", visible=False),
             log=gr.Textbox(
                 label="Log", lines=8, max_lines=8, visible=False, autoscroll=True
             ),
@@ -53,7 +56,7 @@ def build():
 def select_session(jobs, evt: gr.SelectData):
     row = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
     if row is None or row >= len(jobs):
-        return tuple(gr.skip() for _ in range(7))
+        return tuple(gr.skip() for _ in range(8))
     details, log, targets = session_view(jobs[row])
     return (
         details,
@@ -62,6 +65,7 @@ def select_session(jobs, evt: gr.SelectData):
         gr.update(visible=bool(targets["mgf"])),
         gr.update(visible=bool(targets["vqms2"])),
         gr.update(visible=bool(targets["ckpt"])),
+        gr.update(visible=targets["resume"]),
         jobs[row],
     )
 
@@ -114,10 +118,13 @@ def wire(demo, sb, tabs, views, explore, decompress, ckpt):
         meta = read_job(job)
         details, log, _ = session_view(job)
         outs = [p for p in meta.get("outputs", []) if os.path.isfile(p)]
-        if meta.get("status") == "done":
+        status = meta.get("status")
+        if status == "done":
             end = "✅ Done." + "".join(f"\nSaved on the server: {p}" for p in outs)
+        elif status == "paused":
+            end = "⏸️ Paused."
         else:
-            end = f"❌ {meta.get('error')}"
+            end = f"❌ {meta.get('error') or 'Interrupted.'}"
         rows, jobs = list_sessions()
         yield {
             view.log_box: f"{log}\n{end}",
@@ -140,6 +147,7 @@ def wire(demo, sb, tabs, views, explore, decompress, ckpt):
             sb.to_explore,
             sb.to_decompress,
             sb.to_ckpt,
+            sb.to_resume,
             sb.job,
         ],
         **light,
@@ -163,3 +171,15 @@ def wire(demo, sb, tabs, views, explore, decompress, ckpt):
         **light,
     )
     sb.to_ckpt.click(lambda t: t["ckpt"], sb.targets, ckpt, **light)
+    train_view = views["train"]
+    sb.to_resume.click(
+        lambda: (gr.Tabs(selected="train"), gr.update(visible=False)),
+        None,
+        [tabs, sb.to_resume],
+        **light,
+    ).then(
+        with_session_list(train_resume),
+        sb.job,
+        [train_view.log_box, train_view.result_box, *sb.outputs],
+        concurrency_limit=1,
+    )

@@ -1,5 +1,6 @@
 """Train tab: runs train.py as a subprocess and streams its log."""
 
+import contextlib
 import os
 import re
 import signal
@@ -16,58 +17,117 @@ from gui.components.file_picker import host_file_picker
 from gui.config import ROOT
 from gui.jobs import (
     ACTIVE_JOBS,
+    JOB_LOG,
     LogBuffer,
     finish_job,
     mirror_log,
     new_job_dir,
     read_job,
+    reopen_job,
     write_job,
 )
-from gui.sessions import SessionView, file_listing, with_session_list
+from gui.sessions import (
+    SessionView,
+    file_listing,
+    resume_checkpoint,
+    session_status,
+    with_session_list,
+)
+
+# train.py's EXIT_PAUSED; train.py itself isn't imported, as that loads the whole training stack.
+EXIT_PAUSED = 75
 
 _TRAIN = {"proc": None}
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 
-def train_run(data_path, output_dir, batch_size, lr, max_epochs, num_workers):
+def _check_not_running():
     if _TRAIN["proc"] is not None and _TRAIN["proc"].poll() is None:
         raise gr.Error("A training run is already in progress.")
+
+
+def train_run(
+    data_path,
+    output_dir,
+    batch_size,
+    lr,
+    max_epochs,
+    num_workers,
+    compile_mode,
+    checkpoint_minutes,
+):
+    _check_not_running()
     data_path = os.path.expanduser((data_path or "").strip())
     if not data_path or not os.path.exists(data_path):
         raise gr.Error(f"Training library not found: {data_path!r}")
     data_path = os.path.abspath(data_path)
+    output_dir = os.path.expanduser((output_dir or "").strip())
+    # Checked here too, so no failed session is created that would offer the other run's resume.
+    if output_dir and (Path(output_dir) / "resume" / "resume.ckpt").exists():
+        raise gr.Error(
+            f"{output_dir} holds a paused run. Resume it from its session, or use another "
+            "output directory."
+        )
     params = {
         "input": data_path,
         "batch_size": int(batch_size),
         "learning_rate": lr,
         "max_epochs": int(max_epochs),
         "num_workers": int(num_workers),
+        "compile": compile_mode,
+        "checkpoint_minutes": checkpoint_minutes,
     }
     # The session folder holds the record and log; checkpoints go there too unless an
     # output directory is given.
     job = new_job_dir("train", **params)
-    output_dir = os.path.abspath(
-        os.path.expanduser((output_dir or "").strip()) or str(job)
-    )
-    write_job(job, {**read_job(job), "params": {**params, "output_dir": output_dir}})
-    os.makedirs(output_dir, exist_ok=True)
+    params["output_dir"] = os.path.abspath(output_dir or str(job))
+    write_job(job, {**read_job(job), "params": params})
+    os.makedirs(params["output_dir"], exist_ok=True)
+    yield from _launch(job, params)
+
+
+def train_resume(job):
+    """Continue a stopped training session from its resume checkpoint, in the same session."""
+    _check_not_running()
+    meta = read_job(job) if job else {}
+    if (
+        not meta
+        or session_status(job, meta) not in ("paused", "interrupted", "failed")
+        or resume_checkpoint(meta) is None
+    ):
+        raise gr.Error("This session has no paused run to resume.")
+    reopen_job(job)
+    yield from _launch(job, meta["params"], resume=True)
+
+
+def _launch(job, params, resume=False):
+    """Run train.py for a session, yielding (log, result text) until it ends. The outcome is
+    recorded from a thread, so it is saved even if the browser disconnects mid-run."""
+    output_dir = params["output_dir"]
     cmd = [
         sys.executable,
         "-u",
         str(ROOT / "train.py"),
         "--data_path",
-        data_path,
+        params["input"],
         "--output_dir",
         output_dir,
         "--batch_size",
-        str(int(batch_size)),
+        str(params["batch_size"]),
         "--learning_rate",
-        str(lr),
+        str(params["learning_rate"]),
         "--max_epochs",
-        str(int(max_epochs)),
+        str(params["max_epochs"]),
         "--num_workers",
-        str(int(num_workers)),
+        str(params["num_workers"]),
+        # Sessions from before these settings existed don't record them.
+        "--compile",
+        params.get("compile", "none"),
+        "--checkpoint_minutes",
+        str(params.get("checkpoint_minutes", 30)),
     ]
+    if resume:
+        cmd.append("--resume")
     proc = subprocess.Popen(
         cmd,
         cwd=output_dir,  # Lightning writes lightning_logs/ to the working directory
@@ -80,6 +140,11 @@ def train_run(data_path, output_dir, batch_size, lr, max_epochs, num_workers):
     )
     _TRAIN["proc"] = proc
     buf = LogBuffer()
+    if resume:
+        # job.log gets overwritten by this run's log, so that log has to start with the old one.
+        with contextlib.suppress(OSError):
+            buf.write((Path(job) / JOB_LOG).read_text().rstrip("\n") + "\n")
+        buf.write("--- resumed ---\n")
     ACTIVE_JOBS[str(job)] = buf
     buf.write("$ " + " ".join(cmd) + "\n")
     mirror_log(job, buf, lambda: proc.poll() is None)
@@ -95,34 +160,57 @@ def train_run(data_path, output_dir, batch_size, lr, max_epochs, num_workers):
             else:
                 buf.write(line)
 
-    reader = threading.Thread(target=pump, daemon=True)
-    reader.start()
-    while proc.poll() is None:
+    outcome = {}
+
+    def supervise():
+        reader = threading.Thread(target=pump, daemon=True)
+        reader.start()
+        code = proc.wait()
+        reader.join(timeout=5)
+        ckpts = sorted(Path(output_dir).glob("*.ckpt"), key=os.path.getmtime)
+        paused = code == EXIT_PAUSED
+        error = None if code == 0 or paused else f"Exited with code {code}"
+        finish_job(job, ckpts, error, buf.get(), status="paused" if paused else None)
+        outcome.update(code=code, ckpts=ckpts)
+
+    watcher = threading.Thread(target=supervise, daemon=True)
+    watcher.start()
+    while watcher.is_alive():
         time.sleep(1)
         yield buf.get(), gr.update()
-    reader.join(timeout=5)
-    ckpts = sorted(Path(output_dir).glob("*.ckpt"), key=os.path.getmtime)
-    status = (
-        "✅ Finished"
-        if proc.returncode == 0
-        else f"❌ Exited with code {proc.returncode}"
-    )
+    code, ckpts = outcome["code"], outcome["ckpts"]
+    if code == 0:
+        status = "✅ Finished"
+    elif code == EXIT_PAUSED:
+        status = (
+            "⏸️ Paused. Use Resume training on this session in the sidebar."
+            if resume_checkpoint(read_job(job))
+            else "⏸️ Stopped before any resume checkpoint was written: nothing to resume."
+        )
+    else:
+        status = f"❌ Exited with code {code}"
     listing = "\n".join(f"- `{c}`" for c in ckpts) or "_No checkpoints written._"
-    finish_job(
-        job,
-        ckpts,
-        None if proc.returncode == 0 else f"Exited with code {proc.returncode}",
-        buf.get(),
-    )
     yield buf.get() + f"\n{status}", f"**Checkpoints in `{output_dir}`:**\n\n{listing}"
+
+
+def train_pause():
+    proc = _TRAIN["proc"]
+    if proc is None or proc.poll() is not None:
+        return "No training run in progress."
+    # The trainer only: its data loader workers must keep serving until it has saved.
+    proc.send_signal(signal.SIGTERM)
+    return (
+        "Pausing: saving after the current batch. During validation it exits without saving, "
+        "and a resume continues from the last periodic save."
+    )
 
 
 def train_stop():
     proc = _TRAIN["proc"]
     if proc is None or proc.poll() is not None:
         return "No training run in progress."
-    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-    return "Sent stop signal to the training process."
+    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    return "Stopped. Progress since the last periodic save is discarded."
 
 
 def build(sidebar_outputs):
@@ -151,18 +239,28 @@ def build(sidebar_outputs):
                     ep = gr.Number(50, precision=0, label="Max epochs")
                     nw = gr.Number(4, precision=0, label="Data loader workers")
                 with gr.Row():
+                    compile_mode = gr.Dropdown(
+                        ["none", "default", "max-autotune"],
+                        value="none",
+                        label="torch.compile",
+                        info="CUDA only",
+                    )
+                    minutes = gr.Number(30, label="Minutes between resume checkpoints")
+                with gr.Row():
                     btn = gr.Button("Start training", variant="primary")
-                    stop = gr.Button("Stop", variant="stop")
+                    pause = gr.Button("Pause (save and exit)")
+                    stop = gr.Button("Stop (discard unsaved)", variant="stop")
                 stop_msg = gr.Markdown()
             with gr.Column(scale=2):
                 log = gr.Textbox(label="Log", lines=20, max_lines=20, autoscroll=True)
                 ckpts = gr.Markdown()
         btn.click(
             with_session_list(train_run),
-            [data, out, bs, lr, ep, nw],
+            [data, out, bs, lr, ep, nw, compile_mode, minutes],
             [log, ckpts, *sidebar_outputs],
             concurrency_limit=1,
         )
+        pause.click(train_pause, None, stop_msg)
         stop.click(train_stop, None, stop_msg)
     return SimpleNamespace(
         session=SessionView(log, {data: "input"}, ckpts, file_listing("Checkpoints")),

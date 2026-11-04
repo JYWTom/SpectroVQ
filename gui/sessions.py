@@ -16,6 +16,7 @@ from gui.paths import human_size
 SESSION_HEADERS = ["When", "Job", "Status"]
 STATUS_LABELS = {
     "running": "⏳ running",
+    "paused": "⏸️ paused",
     "done": "✅ done",
     "failed": "❌ failed",
     "interrupted": "⚠️ interrupted",
@@ -75,6 +76,16 @@ def with_session_list(job_fn):
             yield (*(gr.skip() for _ in range(n)), *refresh_sessions())
 
     return run
+
+
+def resume_checkpoint(meta):
+    """Path of a training session's resume checkpoint if it has one, else None. Goes by its
+    output directory, which can be outside the session folder."""
+    output_dir = meta.get("params", {}).get("output_dir")
+    if meta.get("kind") != "train" or not output_dir:
+        return None
+    ckpt = Path(output_dir) / "resume" / "resume.ckpt"
+    return ckpt if ckpt.is_file() else None
 
 
 def session_files(job, meta):
@@ -141,14 +152,16 @@ def session_view(job):
     except OSError:
         log = ""
 
-    def newest(suffix):
-        found = [p for p in files if p.suffix == suffix and p.stat().st_size > 0]
+    def newest(*suffixes):
+        found = [p for p in files if p.suffix in suffixes and p.stat().st_size > 0]
         return str(max(found, key=os.path.getmtime)) if found else None
 
     targets = {
-        "mgf": newest(".mgf"),
+        "mgf": newest(".mgf", ".mzML", ".mzml"),
         "vqms2": newest(".vqms2"),
         "ckpt": newest(".ckpt"),
+        "resume": session_status(job, meta) in ("paused", "interrupted", "failed")
+        and resume_checkpoint(meta) is not None,
         "params": params,
     }
     return "\n".join(lines), log, targets

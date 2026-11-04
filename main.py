@@ -4,6 +4,8 @@ import os
 
 import torch
 
+from utils.compile import COMPILE_MODES, compile_model
+from utils.device import ACCELERATORS, resolve_device
 from utils.formats import supported_input_extensions, supported_output_extensions
 from utils.mgfHandler.compressor import SpectrumCompressor
 from utils.mgfHandler.decompressor import SpectrumDecompressor
@@ -21,9 +23,14 @@ argparser.add_argument(
     "--input",
     "-i",
     type=str,
-    help="Input file path (.mgf, or .vqms2 when decompressing)",
+    help="Input file path (.mgf or .mzML, or .vqms2 when decompressing)",
 )
-argparser.add_argument("--output", "-o", type=str, help="Output file name")
+argparser.add_argument(
+    "--output",
+    "-o",
+    type=str,
+    help="Output file name (.mgf or .mzML when decompressing; .mzML needs an archive compressed from mzML)",
+)
 argparser.add_argument("--weights", "-w", type=str, help="Path to model weights")
 argparser.add_argument(
     "--compression_method",
@@ -36,10 +43,27 @@ argparser.add_argument(
     "--batch_size", "-b", type=int, help="Batch size for compression"
 )
 argparser.add_argument(
-    "--quantizer", "-q", type=int, help="Quantizer level for compression"
+    "--quantizer",
+    "-q",
+    type=int,
+    default=4,
+    help="Number of quantizers; must match between compression and decompression (default: 4)",
 )
 argparser.add_argument(
     "--stored_raw", "-sR", action="store_true", help="Store raw reconstructed spectra"
+)
+argparser.add_argument(
+    "--accelerator",
+    type=str,
+    default="auto",
+    choices=ACCELERATORS,
+    help="Lightning accelerator: auto, cpu, cuda, mps",
+)
+argparser.add_argument(
+    "--compile",
+    choices=COMPILE_MODES,
+    default="none",
+    help="torch.compile the encoder and decoder (CUDA only)",
 )
 argparser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
 # %%
@@ -54,6 +78,7 @@ compression_level = arguments.compression_level
 batch_size = arguments.batch_size
 stored_raw = arguments.stored_raw
 verbose = arguments.verbose
+device = resolve_device(arguments.accelerator)
 
 # Double check the input
 if input_file_path is None:
@@ -65,14 +90,16 @@ if weights_path is None:
 
 
 # Load
-torch.backends.cudnn.benchmark = True
+if device.type == "cuda":
+    torch.backends.cudnn.benchmark = True
 # Load the neural network model for spectrum processing
 SpectraStream = getModel.getModel()
 # Apply pre-trained weights to the model
 SpectraStream = getModel.ApplyWeights(SpectraStream, weights_path)
-# Move model to GPU and set to evaluation mode
-SpectraStream.to("cuda")
+# Move model to the Lightning-selected device and set to evaluation mode
+SpectraStream.to(device)
 SpectraStream.eval()
+compile_model(SpectraStream, arguments.compile, device)
 
 level = int(compression_level) if compression_level is not None else None
 # Only the selected backend receives the level; the others stay None (disabled).
@@ -93,10 +120,11 @@ elif compress:
         )
     compressor = SpectrumCompressor(
         inputFilePath=input_file_path,
-        OutputFileName=output_file_path,
+        # The compressor appends its own extensions, so "x.vqms2" must not become "x.vqms2.vqms2".
+        OutputFileName=output_file_path.removesuffix(".vqms2"),
         model=SpectraStream,
         batch_size=batch_size,
-        quantizer=4,
+        quantizer=arguments.quantizer,
         **codec_levels,
     )
     if verbose:
@@ -118,7 +146,7 @@ elif decompress:
         outputFilePath=output_file_path,
         model=SpectraStream,
         batch_size=batch_size,
-        quantizer=4,
+        quantizer=arguments.quantizer,
         stored_raw=stored_raw,
         **codec_levels,
     )

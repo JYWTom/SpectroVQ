@@ -7,7 +7,7 @@ from collections.abc import Iterable, Iterator
 import numpy as np
 from pyteomics import mgf
 
-from .base import Spectrum, SpectrumReader, SpectrumWriter
+from .base import RunMetadata, Spectrum, SpectrumReader, SpectrumWriter
 from .registry import register_reader, register_writer
 
 
@@ -25,7 +25,9 @@ class MGFReader(SpectrumReader):
 class MGFWriter(SpectrumWriter):
     extensions = (".mgf",)
 
-    def write(self, spectra: Iterable[Spectrum]) -> None:
+    def write(
+        self, spectra: Iterable[Spectrum], run: RunMetadata | None = None
+    ) -> None:
         mgf.write(
             (
                 {

@@ -8,24 +8,23 @@ This script loads a trained SpectroVQ model and uses it to denoise MGF files.
 import argparse
 import os
 import sys
-import torch
-from pathlib import Path
 import traceback
 
 # Add utils to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "utils"))
 
+from utils.device import ACCELERATORS, resolve_device
 from utils.mgfHandler.denoiser import MGFDenoiser
-from utils.model.getModel import getModel, ApplyWeights
+from utils.model.getModel import ApplyWeights, getModel
 
 
-def load_model(model_path, device="cuda", yaml_config=None):
+def load_model(model_path, device="auto", yaml_config=None):
     """
     Load a trained SpectroVQ model from checkpoint.
 
     Args:
         model_path (str): Path to the model checkpoint file
-        device (str): Device to load the model on ('cuda' or 'cpu')
+        device (str): Lightning accelerator to load the model on (auto, cpu, cuda, mps)
         yaml_config (str): Optional path to YAML configuration file
 
     Returns:
@@ -40,7 +39,7 @@ def load_model(model_path, device="cuda", yaml_config=None):
     # Load weights using ApplyWeights function
     model = ApplyWeights(model, model_path)
 
-    model.to(device)
+    model.to(resolve_device(device))
     model.eval()
 
     return model
@@ -71,10 +70,13 @@ def main():
         help="Path to YAML configuration file for model parameters",
     )
     parser.add_argument(
+        "--accelerator",
         "--device",
+        dest="accelerator",
         type=str,
-        default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Device to use (cuda or cpu)",
+        default="auto",
+        choices=ACCELERATORS,
+        help="Lightning accelerator: auto, cpu, cuda, mps (--device is a deprecated alias)",
     )
     parser.add_argument(
         "--num_quantizers",
@@ -140,8 +142,8 @@ def main():
         print(f"Loading model from {args.model_path}...")
         if args.yaml_config:
             print(f"Using configuration from {args.yaml_config}")
-        model = load_model(args.model_path, args.device, args.yaml_config)
-        print(f"Model loaded successfully on {args.device}")
+        model = load_model(args.model_path, args.accelerator, args.yaml_config)
+        print(f"Model loaded successfully on {next(model.parameters()).device}")
 
         # Create denoiser
         denoiser = MGFDenoiser(

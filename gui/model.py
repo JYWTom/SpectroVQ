@@ -4,37 +4,11 @@ import os
 import threading
 
 import gradio as gr
-import torch
 
 from gui.config import read_config, save_config
+from utils.compile import COMPILE_MODES, compile_model
+from utils.device import resolve_device
 from utils.model.getModel import ApplyWeights, getModel
-
-
-def available_devices():
-    devices = ["auto"]
-    if torch.cuda.is_available():
-        devices.append("cuda")
-    if (
-        getattr(torch.backends, "mps", None) is not None
-        and torch.backends.mps.is_available()
-    ):
-        devices.append("mps")
-    devices.append("cpu")
-    return devices
-
-
-def resolve_device(device):
-    if device != "auto":
-        return device
-    if torch.cuda.is_available():
-        return "cuda"
-    if (
-        getattr(torch.backends, "mps", None) is not None
-        and torch.backends.mps.is_available()
-    ):
-        return "mps"
-    return "cpu"
-
 
 _MODEL_CACHE = {}
 _MODEL_LOCK = threading.Lock()
@@ -68,14 +42,27 @@ def load_model(ckpt_path, yaml_path, device):
         raise gr.Error(f"Checkpoint not found: {ckpt_path}")
     if yaml_path is not None and not os.path.exists(yaml_path):
         raise gr.Error(f"YAML config not found: {yaml_path}")
-    device = resolve_device(device)
-    key = (os.path.abspath(ckpt_path), os.path.getmtime(ckpt_path), yaml_path, device)
+    device = resolve_device(device).type
+    # Opt in with gui.py --compile or SPECTROVQ_COMPILE=default|max-autotune (CUDA only).
+    compile_mode = os.environ.get("SPECTROVQ_COMPILE", "none")
+    if compile_mode not in COMPILE_MODES:
+        raise gr.Error(
+            f"SPECTROVQ_COMPILE must be one of {', '.join(COMPILE_MODES)}, got {compile_mode!r}"
+        )
+    key = (
+        os.path.abspath(ckpt_path),
+        os.path.getmtime(ckpt_path),
+        yaml_path,
+        device,
+        compile_mode,
+    )
     with _MODEL_LOCK:
         if key not in _MODEL_CACHE:
             _MODEL_CACHE.clear()
             model = ApplyWeights(getModel(yaml_path), ckpt_path)
             model.to(device)
             model.eval()
+            compile_model(model, compile_mode, device)
             _MODEL_CACHE[key] = model
             save_config(
                 ckpt=os.path.abspath(ckpt_path),
@@ -93,7 +80,9 @@ def model_status(ckpt_path, yaml_path, device):
         return f"⚠️ Failed to load model: {e}"
     n_q = model.n_q
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
+    compiled = model.encoder._compiled_call_impl is not None
     return (
-        f"✅ Loaded on **{resolve_device(device)}** · {n_params:.1f}M parameters · "
-        f"{n_q} quantizers · {model.quantizedlen} codes per quantizer per spectrum"
+        f"✅ Loaded on **{resolve_device(device).type}** · {n_params:.1f}M parameters · "
+        f"{n_q} quantizers · {model.quantizedlen} codes per quantizer per spectrum · "
+        f"torch.compile {'on' if compiled else 'off'}"
     )
