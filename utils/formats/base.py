@@ -26,11 +26,27 @@ class Spectrum:
     the .parquet side file): ``title``, ``pepmass`` (m/z, intensity) tuple,
     ``charge``, ``rtinseconds``, ``scans``, ... Format specific extras may be
     added and are round-tripped as-is.
+
+    ``mzml`` holds the source mzML metadata (see ``mzml_metadata``). It is kept
+    apart from ``params`` so it never reaches formats that cannot represent it.
     """
 
     mz: np.ndarray
     intensity: np.ndarray
     params: dict = field(default_factory=dict)
+    mzml: dict = field(default_factory=dict)
+
+
+@dataclass
+class RunMetadata:
+    """File-level metadata captured from the source file.
+
+    ``header`` is the source mzML text up to the first spectrum. ``lossy_params``
+    describes a lossy reconstruction, recorded in the output's processing history.
+    """
+
+    header: str
+    lossy_params: dict[str, str] = field(default_factory=dict)
 
 
 class SpectrumReader(ABC):
@@ -48,6 +64,10 @@ class SpectrumReader(ABC):
         """Load (up to ``limit``) spectra into memory."""
         return list(itertools.islice(iter(self), limit))
 
+    def run_metadata(self) -> RunMetadata | None:
+        """File-level metadata, for formats that have any."""
+        return None
+
 
 class SpectrumWriter(ABC):
     """Writes spectra to a file. Subclasses implement ``write``."""
@@ -58,4 +78,6 @@ class SpectrumWriter(ABC):
         self.path = os.fspath(path)
 
     @abstractmethod
-    def write(self, spectra: Iterable[Spectrum]) -> None: ...
+    def write(
+        self, spectra: Iterable[Spectrum], run: RunMetadata | None = None
+    ) -> None: ...
