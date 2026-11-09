@@ -12,6 +12,7 @@ import gradio as gr
 from gui import config
 from gui.jobs import JOB_FILE, JOB_LOG, JOB_NAME, job_running, read_job
 from gui.paths import human_size
+from utils.resume import ResumeStore
 
 SESSION_HEADERS = ["When", "Job", "Status"]
 STATUS_LABELS = {
@@ -84,8 +85,7 @@ def resume_checkpoint(meta):
     output_dir = meta.get("params", {}).get("output_dir")
     if meta.get("kind") != "train" or not output_dir:
         return None
-    ckpt = Path(output_dir) / "resume" / "resume.ckpt"
-    return ckpt if ckpt.is_file() else None
+    return ResumeStore(output_dir).find()
 
 
 def session_files(job, meta):

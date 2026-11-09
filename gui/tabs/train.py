@@ -33,9 +33,7 @@ from gui.sessions import (
     session_status,
     with_session_list,
 )
-
-# train.py's EXIT_PAUSED; train.py itself isn't imported, as that loads the whole training stack.
-EXIT_PAUSED = 75
+from utils.resume import EXIT_PAUSED, ResumeStore
 
 _TRAIN = {"proc": None}
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
@@ -54,7 +52,7 @@ def train_run(data_path, output_dir, batch_size, lr, max_epochs, num_workers):
     data_path = os.path.abspath(data_path)
     output_dir = os.path.expanduser((output_dir or "").strip())
     # Checked here too, so no failed session is created that would offer the other run's resume.
-    if output_dir and (Path(output_dir) / "resume" / "resume.ckpt").exists():
+    if output_dir and ResumeStore(output_dir).find():
         raise gr.Error(
             f"{output_dir} holds a paused run. Resume it from its session, or use another "
             "output directory."

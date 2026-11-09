@@ -150,7 +150,9 @@ class Run:
 
     @property
     def resume_ckpt(self):
-        return self.dir / "resume" / "resume.ckpt"
+        from utils.resume import ResumeStore
+
+        return ResumeStore(self.dir).checkpoint
 
     def env(self, hooks=None):
         return {
@@ -443,6 +445,19 @@ def test_fresh_start_refused_when_paused_run_exists(library, folder):
 def test_resume_without_checkpoint_refused(library, folder):
     out = Run(library, folder)("--resume", expect=1, script=ROOT / "train.py")
     assert "Nothing to resume" in out
+
+
+def test_resume_with_other_settings_refused(library, folder):
+    run = Run(library, folder)
+    run(hooks={"sigterm": [[0, 3]]}, expect=75)
+    before = run.resume_ckpt.stat().st_mtime_ns
+    out = run("--resume", "--batch_size", "1", "--max_epochs", "5", expect=1)
+    assert "batch_size: first run 2, now 1" in out
+    assert "max_epochs: first run 3, now 5" in out
+    assert run.resume_ckpt.stat().st_mtime_ns == before
+    # Settings that may change, do not block it.
+    run("--resume", "--num_workers", "2", "--checkpoint_minutes", "60")
+    assert run.final()["global_step"] == EPOCHS * BATCHES
 
 
 # 8. Consumers

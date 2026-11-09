@@ -1,7 +1,7 @@
 import argparse
+import json
 import math
 import os
-import shutil
 import sys
 from datetime import timedelta
 from typing import Any
@@ -23,6 +23,7 @@ from transformers import get_cosine_schedule_with_warmup
 from utils.compile import COMPILE_MODES, compile_model
 from utils.device import resolve_device
 from utils.model import modelStream
+from utils.resume import EXIT_PAUSED, ResumeError, ResumeStore, library_fingerprint
 from utils.SpectrumProcessing.SpectraLoading import massSpectrumToVector
 
 
@@ -81,8 +82,6 @@ def transformToTensor(x):
 Bin_size = 0.1
 # Fixed, also on resume: every data order and augmentation below derives from it.
 BASE_SEED = 42
-# Exit code of a graceful pause (EX_TEMPFAIL): train.py can be continued with --resume.
-EXIT_PAUSED = 75
 
 
 class SpectrumAugmentation:
@@ -561,8 +560,8 @@ def parse_args(argv=None):
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="continue from <output_dir>/resume/resume.ckpt; use the same --batch_size, "
-        "--max_epochs and library as the first run",
+        help="continue from <output_dir>/resume/resume.ckpt; --batch_size, --max_epochs, "
+        "--learning_rate and the library must match the first run (checked)",
     )
     parser.add_argument(
         "--checkpoint_minutes",
@@ -586,18 +585,30 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 
+def resume_settings(args):
+    """What has to stay the same across a pause: the sampler position, LR schedule and
+    optimizer state in the checkpoint only fit the run they came from. Worker count,
+    accelerator, compile mode and checkpoint interval may change."""
+    return {
+        "batch_size": args.batch_size,
+        "max_epochs": args.max_epochs,
+        "learning_rate": args.learning_rate,
+        "library": library_fingerprint(args.data_path),
+        # Through JSON, as the recorded copy is: tuples come back as lists.
+        "model": json.loads(json.dumps(model_kwargs2)),
+    }
+
+
 def main(argv=None, extra_callbacks=()):
     args = parse_args(argv)
     output_dir = args.output_dir
-    resume_dir = os.path.join(os.path.abspath(output_dir), "resume")
-    resume_ckpt = os.path.join(resume_dir, "resume.ckpt")
-    if args.resume and not os.path.exists(resume_ckpt):
-        sys.exit(f"Nothing to resume: {resume_ckpt} does not exist.")
-    if not args.resume and os.path.exists(resume_ckpt):
-        sys.exit(
-            f"{resume_ckpt} exists, so a paused run would be overwritten. Continue it with "
-            "--resume, or use another output directory (or delete the file) to start over."
-        )
+    store = ResumeStore(output_dir)
+    try:
+        warnings = store.begin(resume_settings(args), resume=args.resume)
+    except ResumeError as e:
+        sys.exit(str(e))
+    for w in warnings:
+        print(f"Warning: {w}", flush=True)
     # Pause with: kill -TERM <pid>, to this process only, not its data loader workers.
     print(f"Training process PID: {os.getpid()}", flush=True)
 
@@ -662,8 +673,8 @@ def main(argv=None, extra_callbacks=()):
         check_on_train_epoch_end=False,
     )
     resume_callback = ResumeCheckpoint(
-        dirpath=resume_dir,  # a subfolder: the sessions sidebar scans only the top level
-        filename="resume",
+        dirpath=store.dir,
+        filename=store.checkpoint.stem,
         monitor=None,
         save_top_k=1,
         enable_version_counter=False,  # always overwrite one file
@@ -692,18 +703,18 @@ def main(argv=None, extra_callbacks=()):
             LightningTrainer,
             train_dataloaders=train_loader,
             val_dataloaders=test_loader,
-            ckpt_path=resume_ckpt if args.resume else None,
+            ckpt_path=store.checkpoint if args.resume else None,
         )
     except SIGTERMException:
         # Otherwise it exits 0 and looks finished.
         print(
             "Paused. Continue with --resume, using the same settings."
-            if os.path.exists(resume_ckpt)
+            if store.find()
             else "Paused before any resume checkpoint was written: nothing to continue from.",
             flush=True,
         )
         sys.exit(EXIT_PAUSED)
-    shutil.rmtree(resume_dir, ignore_errors=True)  # finished: free about 619 MB
+    store.discard()  # finished
 
 
 if __name__ == "__main__":
