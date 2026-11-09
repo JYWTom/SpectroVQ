@@ -32,7 +32,8 @@ argparser.add_argument(
     "-o",
     type=str,
     required=True,
-    help="Output file name",
+    help="Compress: output path (.vqms2 added if missing; .parquet and "
+    "_compounded.pkl are written next to it). Decompress: output spectra file",
 )
 argparser.add_argument(
     "--weights", "-w", type=str, required=True, help="Path to model weights"

@@ -40,7 +40,9 @@ class SpectrumCompressor:
         Args:
             model: Neural network model for encoding spectra
             inputFilePath (str): Path to the input spectra file (any registered format, e.g. .mgf)
-            OutputFileName (str, optional): Name for output files. Defaults to input filename.
+            OutputFileName (str, optional): Output path without extension (a trailing .vqms2 is
+                accepted); writes <name>.vqms2, <name>.parquet and, if needed, <name>_compounded.pkl.
+                Defaults to the input filename.
             batch_size (int, optional): Number of spectra to process in each batch. Defaults to 128.
             quantizer (int): Number of quantization levels for vector quantization. Defaults to 6.
             gzip_compression_level (int, optional): Compression level for gzip. Defaults to None.
@@ -56,6 +58,9 @@ class SpectrumCompressor:
                 f"Output file name is not defined; using input name {self.OutputFileName} as output name",
                 stacklevel=2,
             )
+        # The extensions are appended below; accept a name that already has one
+        if self.OutputFileName.endswith(".vqms2"):
+            self.OutputFileName = self.OutputFileName[: -len(".vqms2")]
         self.reader = get_reader(inputFilePath)
         self.device = next(self.model.parameters()).device
         self.packer = compress.BitPacker(

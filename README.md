@@ -102,7 +102,7 @@ python denoise.py --input_mgf input.mgf --model_path model.ckpt --output_mgf den
 - `--num_workers`: Number of workers for processing [default: 0]
 
 ### 3. Compression/Decompression (main.py)
-Compress or decompress MGF files using SpectroVQ.
+Compress MS2 spectra (MGF or mzML) to `.vqms2`, or decompress back to MGF. Compression writes `output.vqms2` plus the side files `output.parquet` (metadata) and, when needed, `output_compounded.pkl`; keep them together.
 
 #### Compression:
 ```bash
@@ -111,23 +111,24 @@ python main.py --compress --input input.mgf --output output.vqms2 --weights mode
 
 #### Decompression:
 ```bash
-python main.py --decompress --input input.vqms2 --output output.mgf --weights model.ckpt --compression_method gzip --compression_level 6 --batch_size 32 --quantizer 4
+python main.py --decompress --input output.vqms2 --output restored.mgf --weights model.ckpt --compression_method gzip --compression_level 6 --batch_size 32 --quantizer 4
 ```
 
 **Arguments:**
 - `--compress, -m`: Enable compression mode
 - `--decompress, -d`: Enable decompression mode
 - `--input, -i`: Input file path [required]
-- `--output, -o`: Output file path [required]
+- `--output, -o`: Output path [required]. Compression: `.vqms2` is added if missing
 - `--weights, -w`: Path to model weights [required]
-- `--compression_method, -cM`: Compression method [gzip, zlib, zstd] [required]
-- `--compression_level, -cL`: Compression level [required]
+- `--compression_method, -cM`: Entropy coder [gzip, zlib, zstd] [optional, default: none]
+- `--compression_level, -cL`: Level for the coder (gzip/zlib 1-9, zstd 1-22); give it together with `-cM`
+- Decompression must use the same `-cM`, `-cL` and `-q` as compression
 - `--batch_size, -b`: Batch size for processing [optional]
 - `--quantizer, -q`: Quantizer level for compression [default: 4]
 - `--stored_raw, -sR`: Store raw reconstructed spectra [flag]
 
 ## File Formats
-- **Input**: MGF files for denoising and compression
+- **Input**: MGF for denoising; MGF or mzML (MS2 scans only) for compression
 - **Compressed Output**: .vqms2 files (SpectroVQ compressed format)
 - **Model Checkpoints**: .ckpt or .pt files
 - **Training Data**: .feather files (should contain the columns: 'PrecursorMZ', 'CompoundName', 'Comment', 'm/z', 'intensity', 'Charge')

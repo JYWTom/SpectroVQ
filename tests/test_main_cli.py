@@ -86,3 +86,12 @@ def test_mode_is_required(files):
     r = _main("-i", str(d / "in.mgf"), "-o", str(d / "x"), *_base(d))
     assert r.returncode == 2
     assert "one of the arguments --compress/-m --decompress/-d is required" in r.stderr
+
+
+def test_output_with_vqms2_extension_is_not_doubled(files):
+    """The README passes --output output.vqms2."""
+    d = files
+    r = _main("-m", "-i", str(d / "in.mgf"), "-o", str(d / "readme.vqms2"), *_base(d))
+    assert r.returncode == 0, r.stderr
+    assert (d / "readme.vqms2").exists() and (d / "readme.parquet").exists()
+    assert not (d / "readme.vqms2.vqms2").exists()
