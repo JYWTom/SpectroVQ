@@ -312,7 +312,8 @@ class SpectrumDecompressor:
             if "ExtendedMZ" in metaDataBatch.columns:
                 metaDataBatch.pop("ExtendedMZ")
                 metaDataBatch.pop("ExtendedIT")
-            metaDataBatch.pop("OriginalIndex")
+            # Only present when some spectra were compounded
+            metaDataBatch = metaDataBatch.drop(columns="OriginalIndex", errors="ignore")
 
             # Convert batch to MGF format
             for k in range(current_batch_size):

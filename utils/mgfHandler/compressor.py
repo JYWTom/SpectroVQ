@@ -1,4 +1,3 @@
-from ..Compression import batchprocessor
 from ..Compression import compress
 from ..Compression import torchprocessor
 from ..formats import get_reader
@@ -73,8 +72,7 @@ class SpectrumCompressor:
         self.quantizer = quantizer
         self.metadataFileName = self.OutputFileName + ".parquet"
         self.MaxValList = []
-        if outputOutOfRange:
-            self.ExtendedMzList, self.ExtendedIntensityList = [], []
+        self.ExtendedMzList, self.ExtendedIntensityList = [], []
         self.outputOutOfRange = outputOutOfRange
 
         if batch_size is None:
@@ -154,7 +152,7 @@ class SpectrumCompressor:
             compounded=True,
             verbose=verbose,
         )
-        output_codes = tb.getReconstructIndices(
+        result = tb.getReconstructIndices(
             outputOutOfRange=self.outputOutOfRange,
             quantizer=self.quantizer,
             batch_size=self.batch_size,
@@ -162,22 +160,13 @@ class SpectrumCompressor:
         )
         if verbose >= 1:
             print("Compression completed, processing results...")
-        raw_codes, *extra = output_codes
-        output_codes = raw_codes
-        if len(extra) == 4:
-            self.compounded_codes_list.extend(extra[0])
-            self.compounded_idx_list.extend(extra[1])
-            self.ExtendedMzList.extend(extra[2])
-            self.ExtendedIntensityList.extend(extra[3])
-        elif len(extra) == 2:
-            self.compounded_codes_list.extend(extra[0])
-            self.compounded_idx_list.extend(extra[1])
-        elif len(extra) == 1:
-            self.ExtendedMzList.extend(extra[0][0])
-            self.ExtendedIntensityList.extend(extra[0][1])
-        self.MaxValList.extend(tb.MaxValList)
+        self.compounded_codes_list.extend(result.compounded_codes)
+        self.compounded_idx_list.extend(result.compounded_idx)
+        self.ExtendedMzList.extend(result.extended_mz)
+        self.ExtendedIntensityList.extend(result.extended_it)
+        self.MaxValList.extend(result.max_vals)
         output_codes = np.transpose(
-            np.array(output_codes.cpu().numpy(), dtype=np.int32), (1, 0, 2)
+            np.array(result.codes.cpu().numpy(), dtype=np.int32), (1, 0, 2)
         )  # N B D -> B N D
         # Push the first layer of quantized codes first, then push the 2nd layer of chimeric codes to the packer
         for j in range(output_codes.shape[0]):  # Data Size
@@ -208,51 +197,6 @@ class SpectrumCompressor:
                 )
             with open(self.OutputFileName + "_compounded.pkl", "wb") as f:
                 pickle.dump(self.compounded_idx_list, f)
-
-    def ProcessSpectra(self, mz, intensity, idx=0):
-        """
-        Process a batch of spectra for compression.
-
-        Encodes the given m/z and intensity arrays using the neural network model,
-        extracts vector quantized codes, handles chimeric spectra if enabled,
-        and stores the compressed codes using the bit packer.
-
-        Args:
-            mz (list): List of m/z arrays for the batch of spectra
-            intensity (list): List of intensity arrays for the batch of spectra
-            idx (int): Starting index for tracking chimeric spectra. Defaults to 0.
-        """
-        bp = batchprocessor.SpectrumBatchEncoder(
-            mz, intensity, self.model, compounded=True
-        )
-        output_codes = bp.getReconstructIndices(
-            outputOutOfRange=self.outputOutOfRange, quantizer=self.quantizer
-        )
-        raw_codes, *extra = output_codes
-        output_codes = raw_codes
-        if len(extra) == 4:
-            self.compounded_codes_list.extend(extra[0])
-            ids = [int(id + idx * self.batch_size) for id in extra[1]]
-            self.compounded_idx_list.extend(ids)
-            self.ExtendedMzList.extend(extra[2])
-            self.ExtendedIntensityList.extend(extra[3])
-        elif len(extra) == 2:
-            self.compounded_codes_list.extend(extra[0])
-            ids = [int(id + idx * self.batch_size) for id in extra[1]]
-            self.compounded_idx_list.extend(ids)
-        elif len(extra) == 1:
-            self.ExtendedMzList.extend(extra[0][0])
-            self.ExtendedIntensityList.extend(extra[0][1])
-        self.MaxValList.extend(bp.MaxValList)
-        output_codes = np.transpose(
-            np.array(output_codes.cpu().numpy(), dtype=int), (1, 0, 2)
-        )  # N B D -> B N D
-        for j in range(output_codes.shape[0]):  # Batch Number
-            for k in range(self.quantizer):  # Number of quantizers
-                for l in range(
-                    self.model.quantizedlen
-                ):  # Number of integers in each quantizer
-                    self.packer.push(output_codes[j, k, l])  # First in First out
 
 
 class MGFCompressor(SpectrumCompressor):
