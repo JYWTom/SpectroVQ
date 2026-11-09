@@ -42,7 +42,7 @@ class ZlibCompressedFile:
             raise IOError("File not open for writing")
 
         if self.compressor is None:
-            self.compressor = zlib.compressobj()
+            raise ValueError("Cannot write after flush: the zlib stream is finished")
 
         compressed = self.compressor.compress(data)
         if compressed:
@@ -64,18 +64,11 @@ class ZlibCompressedFile:
 
         if size < 0:
             # Read all available data
+            result, self._buffer = self._buffer, b""
             compressed = self.fileobj.read()
-            if not compressed:
-                return b""
-
-            # Decompress all data
-            try:
-                decompressed = self.decompressor.decompress(compressed)
-                decompressed += self.decompressor.flush()
-                return decompressed
-            except zlib.error:
-                # Handle potential zlib errors by returning what we have
-                return b""
+            if compressed:
+                result += self.decompressor.decompress(compressed)
+            return result + self.decompressor.flush()
 
         # If we already have enough data in the buffer, return it
         if len(self._buffer) >= size:
@@ -91,46 +84,34 @@ class ZlibCompressedFile:
             chunk = self.fileobj.read(4096)  # Read in reasonable chunks
             if not chunk:
                 # End of file reached
-                if self.decompressor:
-                    try:
-                        result += self.decompressor.flush()
-                    except zlib.error:
-                        pass  # Ignore flush errors at EOF
+                result += self.decompressor.flush()
                 return result
 
-            try:
-                decompressed = self.decompressor.decompress(chunk)
-                if len(result) + len(decompressed) <= size:
-                    # Still need more data
-                    result += decompressed
-                else:
-                    # We have enough data now
-                    needed = size - len(result)
-                    result += decompressed[:needed]
-                    self._buffer = decompressed[needed:]
-                    break
-            except zlib.error:
-                # Handle decompress errors by returning what we have so far
-                return result
+            # A corrupt stream raises zlib.error rather than reading as a short file
+            decompressed = self.decompressor.decompress(chunk)
+            if len(result) + len(decompressed) <= size:
+                # Still need more data
+                result += decompressed
+            else:
+                # We have enough data now
+                needed = size - len(result)
+                result += decompressed[:needed]
+                self._buffer = decompressed[needed:]
+                break
 
         return result
 
     def flush(self) -> None:
         if self.mode == "w" and self.compressor:
-            try:
-                remaining = self.compressor.flush()
-                if remaining:
-                    self.fileobj.write(remaining)
-            except zlib.error:
-                # Handle potential zlib errors during flush
-                pass
+            # Finishes the zlib stream; a second flush (from close) has nothing to do
+            remaining = self.compressor.flush()
+            self.compressor = None
+            if remaining:
+                self.fileobj.write(remaining)
         self.fileobj.flush()
 
     def close(self) -> None:
-        try:
-            self.flush()
-        except:
-            pass  # Ignore errors on flush during close
+        self.flush()
         self.fileobj.close()
 
 
@@ -234,15 +215,10 @@ class BitPacker:
             self._current_value = 0
             self._current_bits = 0
 
-        try:
-            self.fo.flush()
-            if self.compression_type in ["gzip", "zlib"]:
-                self.fo.close()
-        except Exception as e:
-            # Handle potential flush errors - log them if needed
-            import sys
-
-            print(f"Warning: Error during flush: {str(e)}", file=sys.stderr)
+        # A failed flush leaves a truncated file, so let it raise
+        self.fo.flush()
+        if self.compression_type in ["gzip", "zlib"]:
+            self.fo.close()
 
     def close(self):
         """Close the underlying file. Call after ``flush``."""

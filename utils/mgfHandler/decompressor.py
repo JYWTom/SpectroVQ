@@ -7,7 +7,6 @@ import torch
 import numpy as np
 import pandas as pd
 import pickle
-import traceback
 from typing import OrderedDict
 
 DEFAULTMGFPARAMSKEYS = [
@@ -81,6 +80,16 @@ class SpectrumDecompressor:
 
         self.compounded_original_codes_dict = {}
 
+    def _pull(self):
+        value = self.depacker.pull()
+        if value is None:
+            raise ValueError(
+                f"{self.inputFileName} ended before all codes were read: the file is "
+                "truncated, or --quantizer / the compression method differ from "
+                "the ones used to compress it"
+            )
+        return value
+
     @staticmethod
     def changeSpectrumName(name):
         """
@@ -122,6 +131,12 @@ class SpectrumDecompressor:
 
     # Mode 1: Load All Spectra, then perform decompression
     def DecompressAll(self, verbose=0):
+        try:
+            self._decompress_all(verbose)
+        finally:
+            self.depacker.close()  # also on a truncated or corrupt input
+
+    def _decompress_all(self, verbose):
         """
         Decompress all spectra from compressed format to MGF.
 
@@ -152,14 +167,7 @@ class SpectrumDecompressor:
                 print(f"Extracted codes for {j} spectra...")
             for k in range(self.quantizer):
                 for l in range(self.model.quantizedlen):
-                    try:
-                        all_output_codes[j, k, l] = self.depacker.pull()
-                    except:
-                        traceback.print_exc()
-                        print(
-                            f"Error extracting code for spectrum {j}, quantizer {k}, position {l}"
-                        )
-                        raise
+                    all_output_codes[j, k, l] = self._pull()
 
         # Process all codes in batches
         if verbose >= 1:
@@ -182,7 +190,7 @@ class SpectrumDecompressor:
             for j in range(compounded_indices.shape[0]):
                 for k in range(self.quantizer):
                     for l in range(self.model.quantizedlen):
-                        compounded_codes[j, k, l] = self.depacker.pull()
+                        compounded_codes[j, k, l] = self._pull()
 
             compounded_max_value_list = df_metadata["MaxVal"].values[compounded_indices]
             df_metadata["OriginalIndex"] = range(len(df_metadata))
@@ -264,9 +272,6 @@ class SpectrumDecompressor:
                     CompoundedSpectrumDict[
                         str(batched_compounded_metadata.iloc[k]["OriginalIndex"])
                     ].params.pop("OriginalIndex")
-        # Every code has been read
-        self.depacker.close()
-
         # Process other spectrum normally
         for batch_start in range(0, total_spectra, self.batch_size):
             batch_end = min(batch_start + self.batch_size, total_spectra)

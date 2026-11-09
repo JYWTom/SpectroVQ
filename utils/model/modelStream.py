@@ -205,8 +205,8 @@ class SpectroVQ(nn.Module):
                 l2norm=quantl2,
             )
             if useQINCo:
-                self.quantization = QINCo(
-                    d=self.quantizationdim, K=codebook_size, L=1, M=n_q, h=64
+                raise NotImplementedError(
+                    "useQINCo=True is not supported: no QINCo quantizer is implemented"
                 )
         else:
             self.quantization = nn.Identity()
