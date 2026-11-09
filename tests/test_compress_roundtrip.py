@@ -54,18 +54,36 @@ def _out_of_range(s):
     return s.mz[keep], s.intensity[keep]
 
 
-def test_compress_decompress_roundtrip(tmp_path, model):
+CODECS = {
+    "none": {"zlib_compression_level": None},
+    "gzip": {"gzip_compression_level": 6, "zlib_compression_level": None},
+    "zlib": {"zlib_compression_level": 6},
+    "zstd": {"zstd_compression_level": 3, "zlib_compression_level": None},
+}
+
+
+@pytest.mark.parametrize("codec", CODECS)
+def test_compress_decompress_roundtrip(tmp_path, model, codec):
     src = tmp_path / "in.mgf"
     get_writer(str(src)).write(_spectra())
     stem = str(tmp_path / "packed")
 
-    SpectrumCompressor(
-        model, str(src), OutputFileName=stem, batch_size=2, quantizer=N_Q
-    ).CompressAll(num_workers=0)
+    compressor = SpectrumCompressor(
+        model,
+        str(src),
+        OutputFileName=stem,
+        batch_size=2,
+        quantizer=N_Q,
+        **CODECS[codec],
+    )
+    compressor.CompressAll(num_workers=0)
+    assert compressor.packer._raw_fo.closed
     out = tmp_path / "out.mgf"
-    SpectrumDecompressor(
-        model, stem + ".vqms2", str(out), batch_size=2, quantizer=N_Q
-    ).DecompressAll()
+    decompressor = SpectrumDecompressor(
+        model, stem + ".vqms2", str(out), batch_size=2, quantizer=N_Q, **CODECS[codec]
+    )
+    decompressor.DecompressAll()
+    assert decompressor.depacker._raw_fo.closed
 
     back = get_reader(str(out)).read_all()
     assert [s.params["title"] for s in back] == [s.params["title"] for s in _spectra()]

@@ -67,24 +67,17 @@ class SpectrumDecompressor:
         )
         self.metadataFileName = self.inputFileNameWithoutExt + ".parquet"
         self.MaxValList = []
-        if batch_size is None:
-            Warning("Batch size is not defined; using default batch size of 128")
-            self.batch_size = 128
-        else:
-            self.batch_size = batch_size
+        self.batch_size = 128 if batch_size is None else batch_size
         self.quantizer = quantizer
         self.stored_raw = stored_raw
         # Always process compounded spectra if available for reconstruction
         self.process_compounded = True
         self.compounded_codes_list = []
         self.compounded_idx_list = []  # stays empty without a _compounded.pkl
+        # The compressor only writes this file when some spectra were compounded
         if os.path.exists(self.inputFileNameWithoutExt + "_compounded.pkl"):
             with open(self.inputFileNameWithoutExt + "_compounded.pkl", "rb") as f:
                 self.compounded_idx_list = pickle.load(f)
-        else:
-            Warning(
-                "Compounded file not found, compounded spectra will not be processed"
-            )
 
         self.compounded_original_codes_dict = {}
 
@@ -271,6 +264,9 @@ class SpectrumDecompressor:
                     CompoundedSpectrumDict[
                         str(batched_compounded_metadata.iloc[k]["OriginalIndex"])
                     ].params.pop("OriginalIndex")
+        # Every code has been read
+        self.depacker.close()
+
         # Process other spectrum normally
         for batch_start in range(0, total_spectra, self.batch_size):
             batch_end = min(batch_start + self.batch_size, total_spectra)

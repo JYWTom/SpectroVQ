@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pickle
+import warnings
 
 
 DEFAULTMGFPARAMSKEYS = [
@@ -51,8 +52,9 @@ class SpectrumCompressor:
         self.OutputFileName = OutputFileName
         if self.OutputFileName is None:
             self.OutputFileName = os.path.basename(inputFilePath).split(".")[0]
-            Warning(
-                f"Output file name is not defined; using input name {self.OutputFileName} as output name"
+            warnings.warn(
+                f"Output file name is not defined; using input name {self.OutputFileName} as output name",
+                stacklevel=2,
             )
         self.reader = get_reader(inputFilePath)
         self.device = next(self.model.parameters()).device
@@ -75,11 +77,7 @@ class SpectrumCompressor:
         self.ExtendedMzList, self.ExtendedIntensityList = [], []
         self.outputOutOfRange = outputOutOfRange
 
-        if batch_size is None:
-            Warning("Batch size is not defined; using default batch size of 128")
-            self.batch_size = 128
-        else:
-            self.batch_size = batch_size
+        self.batch_size = 128 if batch_size is None else batch_size
 
         self.compounded_codes_list = []
         self.compounded_idx_list = []
@@ -91,7 +89,7 @@ class SpectrumCompressor:
         Extracts relevant metadata from the parameter list, processes pepmass and charge data,
         adds maximum values, and saves to a compressed parquet file.
         """
-        df_meta = pd.DataFrame.from_dict(self.paramList)
+        df_meta = pd.DataFrame(self.paramList)
         # df_meta['pepmass'] = df_meta['pepmass'].astype(str)
         df_meta["pepmz"] = df_meta["pepmass"].apply(lambda x: x[0])
         df_meta["pepit"] = df_meta["pepmass"].apply(
@@ -188,6 +186,7 @@ class SpectrumCompressor:
         if verbose >= 1:
             print(f"Flushing Packer")
         self.packer.flush()
+        self.packer.close()
         self.ProcessMetaData()
 
         if len(self.compounded_idx_list) > 0:

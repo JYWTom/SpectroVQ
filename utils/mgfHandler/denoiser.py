@@ -51,7 +51,7 @@ class MGFDenoiser:
     def __init__(self, model: SpectroVQ, inputMGF, outputMGF):
         self.inputMGF = inputMGF
         if not os.path.exists(self.inputMGF):
-            Warning(f"Input file {self.inputMGF} does not exist")
+            raise FileNotFoundError(f"Input file {self.inputMGF} does not exist")
         self.outputMGF = outputMGF
         self.model = model
         self.device = next(self.model.parameters()).device

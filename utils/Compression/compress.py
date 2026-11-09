@@ -244,6 +244,10 @@ class BitPacker:
 
             print(f"Warning: Error during flush: {str(e)}", file=sys.stderr)
 
+    def close(self):
+        """Close the underlying file. Call after ``flush``."""
+        self._raw_fo.close()
+
 
 class BitUnpacker:
     """BitUnpacker does the opposite of `BitPacker`.
@@ -275,6 +279,7 @@ class BitUnpacker:
         zstd_compression=None,
     ):
         self.bits = bits
+        self._raw_fo = fo
 
         # Count compression methods specified
         compression_methods = sum(
@@ -328,6 +333,10 @@ class BitUnpacker:
         self._current_value >>= self.bits
         self._current_bits -= self.bits
         return out
+
+    def close(self):
+        """Close the underlying file."""
+        self._raw_fo.close()
 
 
 def create_compressed_bit_packer(
