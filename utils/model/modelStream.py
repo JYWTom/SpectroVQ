@@ -150,6 +150,7 @@ class SpectroVQ(nn.Module):
 
         self.quantizationdim = quantizationdim
         self.n_q = n_q
+        self.codebook_size = codebook_size
         flattenShape = (
             self.encoder(torch.randn(1, inputChannel, inputSize)).size(1),
             self.encoder(torch.randn(1, inputChannel, inputSize)).size(2),

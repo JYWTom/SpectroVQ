@@ -217,8 +217,8 @@ class BitPacker:
 
         # A failed flush leaves a truncated file, so let it raise
         self.fo.flush()
-        if self.compression_type in ["gzip", "zlib"]:
-            self.fo.close()
+        if isinstance(self.fo, (gzip.GzipFile, ZlibCompressedFile)):
+            self.fo.close()  # the wrapper only; close() closes the raw file
 
     def close(self):
         """Close the underlying file. Call after ``flush``."""

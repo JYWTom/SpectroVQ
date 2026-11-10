@@ -1,14 +1,14 @@
-from ..Compression import compress
-from ..Compression import torchprocessor
-from ..formats import get_reader
 import os
-import torch
-import numpy as np
-import pandas as pd
-import pyarrow as pa
 import pickle
 import warnings
 
+import numpy as np
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from ..Compression import compress, header, torchprocessor
+from ..formats import get_reader
 
 DEFAULTMGFPARAMSKEYS = [
     "title",
@@ -59,8 +59,8 @@ class SpectrumCompressor:
                 stacklevel=2,
             )
         # The extensions are appended below; accept a name that already has one
-        if self.OutputFileName.endswith(".vqms2"):
-            self.OutputFileName = self.OutputFileName[: -len(".vqms2")]
+        self.OutputFileName = self.OutputFileName.removesuffix(".vqms2")
+        header.check_codebook(model)
         self.reader = get_reader(inputFilePath)
         self.device = next(self.model.parameters()).device
         self.packer = compress.BitPacker(
@@ -107,7 +107,16 @@ class SpectrumCompressor:
             df_meta["ExtendedMZ"] = self.ExtendedMzList
             df_meta["ExtendedIT"] = self.ExtendedIntensityList
         df_meta.pop("pepmass")
-        df_meta.to_parquet(
+        # Record what decoding needs; the code stream itself has no header
+        table = pa.Table.from_pandas(df_meta)
+        settings = header.make(
+            self.quantizer,
+            self.packer.compression_type or "none",
+            self.model.quantizedlen,
+        )
+        table = table.replace_schema_metadata({**table.schema.metadata, **settings})
+        pq.write_table(
+            table,
             self.metadataFileName,
             compression="gzip",
             compression_level=self.parquet_compression_level,

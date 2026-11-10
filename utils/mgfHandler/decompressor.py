@@ -1,5 +1,5 @@
 from utils.Compression import batchprocessor
-from utils.Compression import compress
+from utils.Compression import compress, header
 from utils.Compression import postprocessing
 from utils.formats import Spectrum, get_writer
 import os
@@ -57,6 +57,20 @@ class SpectrumDecompressor:
         self.device = next(self.model.parameters()).device
         assert os.path.exists(self.inputFileName), "Input file does not exist"
         self.inputFileNameWithoutExt = ".".join(inputFileName.split(".")[:-1])
+        self.metadataFileName = self.inputFileNameWithoutExt + ".parquet"
+        # Check the recorded settings before reading any codes
+        header.check_codebook(model)
+        if os.path.exists(self.metadataFileName):
+            header.check(
+                self.metadataFileName,
+                quantizer,
+                header.codec_name(
+                    gzip_compression_level,
+                    zlib_compression_level,
+                    zstd_compression_level,
+                ),
+                self.model.quantizedlen,
+            )
         self.depacker = compress.BitUnpacker(
             10,
             open(self.inputFileName, "rb"),
@@ -64,7 +78,6 @@ class SpectrumDecompressor:
             zlib_compression=zlib_compression_level,
             zstd_compression=zstd_compression_level,
         )
-        self.metadataFileName = self.inputFileNameWithoutExt + ".parquet"
         self.MaxValList = []
         self.batch_size = 128 if batch_size is None else batch_size
         self.quantizer = quantizer

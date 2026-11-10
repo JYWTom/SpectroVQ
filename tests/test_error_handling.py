@@ -3,6 +3,7 @@
 import io
 import zlib
 from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
@@ -79,4 +80,5 @@ def test_zlib_file_roundtrip():
 
 def test_qinco_is_rejected():
     with pytest.raises(NotImplementedError, match="QINCo"):
-        SpectroVQ(**{**DEFAULTPARAMS, "useQINCo": True})
+        params: dict[str, Any] = {**DEFAULTPARAMS, "useQINCo": True}
+        SpectroVQ(**params)
