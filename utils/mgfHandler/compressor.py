@@ -1,16 +1,15 @@
-from ..Compression import batchprocessor
-from ..Compression import compress
-from ..Compression import torchprocessor
-from ..formats import get_reader
-from ..formats.mzml_metadata import COLUMNS_KEY, HEADER_KEY, encode_columns
 import os
-import torch
+import pickle
+import warnings
+
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
-import pickle
 
+from ..Compression import compress, header, torchprocessor
+from ..formats import get_reader
+from ..formats.mzml_metadata import COLUMNS_KEY, HEADER_KEY, encode_columns
 
 DEFAULTMGFPARAMSKEYS = [
     "title",
@@ -42,7 +41,9 @@ class SpectrumCompressor:
         Args:
             model: Neural network model for encoding spectra
             inputFilePath (str): Path to the input spectra file (any registered format, e.g. .mgf)
-            OutputFileName (str, optional): Name for output files. Defaults to input filename.
+            OutputFileName (str, optional): Output path without extension (a trailing .vqms2 is
+                accepted); writes <name>.vqms2, <name>.parquet and, if needed, <name>_compounded.pkl.
+                Defaults to the input filename.
             batch_size (int, optional): Number of spectra to process in each batch. Defaults to 128.
             quantizer (int): Number of quantization levels for vector quantization. Defaults to 6.
             gzip_compression_level (int, optional): Compression level for gzip. Defaults to None.
@@ -54,9 +55,13 @@ class SpectrumCompressor:
         self.OutputFileName = OutputFileName
         if self.OutputFileName is None:
             self.OutputFileName = os.path.basename(inputFilePath).split(".")[0]
-            Warning(
-                f"Output file name is not defined; using input name {self.OutputFileName} as output name"
+            warnings.warn(
+                f"Output file name is not defined; using input name {self.OutputFileName} as output name",
+                stacklevel=2,
             )
+        # The extensions are appended below; accept a name that already has one
+        self.OutputFileName = self.OutputFileName.removesuffix(".vqms2")
+        header.check_codebook(model)
         self.reader = get_reader(inputFilePath)
         self.device = next(self.model.parameters()).device
         self.packer = compress.BitPacker(
@@ -75,15 +80,10 @@ class SpectrumCompressor:
         self.quantizer = quantizer
         self.metadataFileName = self.OutputFileName + ".parquet"
         self.MaxValList = []
-        if outputOutOfRange:
-            self.ExtendedMzList, self.ExtendedIntensityList = [], []
+        self.ExtendedMzList, self.ExtendedIntensityList = [], []
         self.outputOutOfRange = outputOutOfRange
 
-        if batch_size is None:
-            Warning("Batch size is not defined; using default batch size of 128")
-            self.batch_size = 128
-        else:
-            self.batch_size = batch_size
+        self.batch_size = 128 if batch_size is None else batch_size
 
         self.compounded_codes_list = []
         self.compounded_idx_list = []
@@ -95,7 +95,7 @@ class SpectrumCompressor:
         Extracts relevant metadata from the parameter list, processes pepmass and charge data,
         adds maximum values, and saves to a compressed parquet file.
         """
-        df_meta = pd.DataFrame.from_dict(self.paramList)
+        df_meta = pd.DataFrame(self.paramList)
         # df_meta['pepmass'] = df_meta['pepmass'].astype(str)
         df_meta["pepmz"] = df_meta["pepmass"].apply(lambda x: x[0])
         df_meta["pepit"] = df_meta["pepmass"].apply(
@@ -135,6 +135,15 @@ class SpectrumCompressor:
                     COLUMNS_KEY: definitions,
                 }
             )
+        # Record what decoding needs; the code stream itself has no header
+        settings = header.make(
+            self.quantizer,
+            self.packer.compression_type or "none",
+            self.model.quantizedlen,
+        )
+        table = table.replace_schema_metadata(
+            {**(table.schema.metadata or {}), **settings}
+        )
         pq.write_table(
             table,
             self.metadataFileName,
@@ -185,7 +194,7 @@ class SpectrumCompressor:
             compounded=True,
             verbose=verbose,
         )
-        output_codes = tb.getReconstructIndices(
+        result = tb.getReconstructIndices(
             outputOutOfRange=self.outputOutOfRange,
             quantizer=self.quantizer,
             batch_size=self.batch_size,
@@ -193,22 +202,13 @@ class SpectrumCompressor:
         )
         if verbose >= 1:
             print("Compression completed, processing results...")
-        raw_codes, *extra = output_codes
-        output_codes = raw_codes
-        if len(extra) == 4:
-            self.compounded_codes_list.extend(extra[0])
-            self.compounded_idx_list.extend(extra[1])
-            self.ExtendedMzList.extend(extra[2])
-            self.ExtendedIntensityList.extend(extra[3])
-        elif len(extra) == 2:
-            self.compounded_codes_list.extend(extra[0])
-            self.compounded_idx_list.extend(extra[1])
-        elif len(extra) == 1:
-            self.ExtendedMzList.extend(extra[0][0])
-            self.ExtendedIntensityList.extend(extra[0][1])
-        self.MaxValList.extend(tb.MaxValList)
+        self.compounded_codes_list.extend(result.compounded_codes)
+        self.compounded_idx_list.extend(result.compounded_idx)
+        self.ExtendedMzList.extend(result.extended_mz)
+        self.ExtendedIntensityList.extend(result.extended_it)
+        self.MaxValList.extend(result.max_vals)
         output_codes = np.transpose(
-            np.array(output_codes.cpu().numpy(), dtype=np.int32), (1, 0, 2)
+            np.array(result.codes.cpu().numpy(), dtype=np.int32), (1, 0, 2)
         )  # N B D -> B N D
         # Push the first layer of quantized codes first, then push the 2nd layer of chimeric codes to the packer
         for j in range(output_codes.shape[0]):  # Data Size
@@ -230,6 +230,7 @@ class SpectrumCompressor:
         if verbose >= 1:
             print(f"Flushing Packer")
         self.packer.flush()
+        self.packer.close()
         self.ProcessMetaData()
 
         if len(self.compounded_idx_list) > 0:
@@ -239,51 +240,6 @@ class SpectrumCompressor:
                 )
             with open(self.OutputFileName + "_compounded.pkl", "wb") as f:
                 pickle.dump(self.compounded_idx_list, f)
-
-    def ProcessSpectra(self, mz, intensity, idx=0):
-        """
-        Process a batch of spectra for compression.
-
-        Encodes the given m/z and intensity arrays using the neural network model,
-        extracts vector quantized codes, handles chimeric spectra if enabled,
-        and stores the compressed codes using the bit packer.
-
-        Args:
-            mz (list): List of m/z arrays for the batch of spectra
-            intensity (list): List of intensity arrays for the batch of spectra
-            idx (int): Starting index for tracking chimeric spectra. Defaults to 0.
-        """
-        bp = batchprocessor.SpectrumBatchEncoder(
-            mz, intensity, self.model, compounded=True
-        )
-        output_codes = bp.getReconstructIndices(
-            outputOutOfRange=self.outputOutOfRange, quantizer=self.quantizer
-        )
-        raw_codes, *extra = output_codes
-        output_codes = raw_codes
-        if len(extra) == 4:
-            self.compounded_codes_list.extend(extra[0])
-            ids = [int(id + idx * self.batch_size) for id in extra[1]]
-            self.compounded_idx_list.extend(ids)
-            self.ExtendedMzList.extend(extra[2])
-            self.ExtendedIntensityList.extend(extra[3])
-        elif len(extra) == 2:
-            self.compounded_codes_list.extend(extra[0])
-            ids = [int(id + idx * self.batch_size) for id in extra[1]]
-            self.compounded_idx_list.extend(ids)
-        elif len(extra) == 1:
-            self.ExtendedMzList.extend(extra[0][0])
-            self.ExtendedIntensityList.extend(extra[0][1])
-        self.MaxValList.extend(bp.MaxValList)
-        output_codes = np.transpose(
-            np.array(output_codes.cpu().numpy(), dtype=int), (1, 0, 2)
-        )  # N B D -> B N D
-        for j in range(output_codes.shape[0]):  # Batch Number
-            for k in range(self.quantizer):  # Number of quantizers
-                for l in range(
-                    self.model.quantizedlen
-                ):  # Number of integers in each quantizer
-                    self.packer.push(output_codes[j, k, l])  # First in First out
 
 
 class MGFCompressor(SpectrumCompressor):

@@ -150,6 +150,7 @@ class SpectroVQ(nn.Module):
 
         self.quantizationdim = quantizationdim
         self.n_q = n_q
+        self.codebook_size = codebook_size
         flattenShape = (
             self.encoder(torch.randn(1, inputChannel, inputSize)).size(1),
             self.encoder(torch.randn(1, inputChannel, inputSize)).size(2),
@@ -205,8 +206,8 @@ class SpectroVQ(nn.Module):
                 l2norm=quantl2,
             )
             if useQINCo:
-                self.quantization = QINCo(
-                    d=self.quantizationdim, K=codebook_size, L=1, M=n_q, h=64
+                raise NotImplementedError(
+                    "useQINCo=True is not supported: no QINCo quantizer is implemented"
                 )
         else:
             self.quantization = nn.Identity()

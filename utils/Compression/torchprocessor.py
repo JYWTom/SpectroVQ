@@ -1,8 +1,29 @@
-from torch.utils.data import Dataset, DataLoader
+from dataclasses import dataclass, field
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, Dataset
+
 from ..SpectrumProcessing import SpectraLoading
 from .preprocessing import rescaleSpectra
-import torch
-import numpy as np
+
+
+@dataclass
+class EncodeResult:
+    """Output of ``SpectrumTorchBatchEncoder.getReconstructIndices``.
+
+    Fields that were not requested stay empty, so callers never branch on
+    which flags were set.
+    """
+
+    codes: torch.Tensor  # N_q x B x D codebook indices
+    max_vals: list = field(default_factory=list)  # per spectrum, B
+    # Second-pass codes for spectra whose residual was re-encoded, and their indices
+    compounded_codes: list = field(default_factory=list)
+    compounded_idx: list = field(default_factory=list)
+    # Peaks outside the model's m/z range, stored verbatim; one array per spectrum
+    extended_mz: list = field(default_factory=list)
+    extended_it: list = field(default_factory=list)
 
 
 class SpectrumBatch(Dataset):
@@ -59,8 +80,7 @@ class SpectrumTorchBatchEncoder:
             drop_last=False,
         )
         CodeList = []
-        if outputOutOfRange:
-            extendedmz, extendedit = [], []
+        extendedmz, extendedit = [], []
         with torch.no_grad():
             for batchidx, (inputBatch, MaxVal) in enumerate(DataLoaderBatch):
                 self.MaxValList.extend(MaxVal.numpy().tolist())
@@ -119,17 +139,11 @@ class SpectrumTorchBatchEncoder:
                     print(f"Processed batch {batchidx + 1}/{len(DataLoaderBatch)}")
             finalCode = torch.concat(CodeList, dim=1)
 
-        if (self.compounded) & (outputOutOfRange):
-            return (
-                finalCode,
-                self.compoundedCodes,
-                self.compoundedCodesIdx,
-                extendedmz,
-                extendedit,
-            )
-        else:
-            if self.compounded:
-                return finalCode, self.compoundedCodes, self.compoundedCodesIdx, "dummy"
-            if outputOutOfRange:
-                return finalCode, extendedmz, extendedit
-        return finalCode
+        return EncodeResult(
+            codes=finalCode,
+            max_vals=list(self.MaxValList),
+            compounded_codes=list(self.compoundedCodes),
+            compounded_idx=list(self.compoundedCodesIdx),
+            extended_mz=extendedmz,
+            extended_it=extendedit,
+        )

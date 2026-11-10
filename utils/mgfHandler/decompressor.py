@@ -1,5 +1,5 @@
 from utils.Compression import batchprocessor
-from utils.Compression import compress
+from utils.Compression import compress, header
 from utils.Compression import postprocessing
 from utils.formats import RunMetadata, Spectrum, get_writer
 from utils.formats.mzml import MzMLWriter
@@ -17,7 +17,6 @@ import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 import pickle
-import traceback
 from typing import OrderedDict
 
 DEFAULTMGFPARAMSKEYS = [
@@ -68,14 +67,17 @@ class SpectrumDecompressor:
         self.device = next(self.model.parameters()).device
         assert os.path.exists(self.inputFileName), "Input file does not exist"
         self.inputFileNameWithoutExt = ".".join(inputFileName.split(".")[:-1])
-        self.depacker = compress.BitUnpacker(
-            10,
-            open(self.inputFileName, "rb"),
-            gzip_compression=gzip_compression_level,
-            zlib_compression=zlib_compression_level,
-            zstd_compression=zstd_compression_level,
-        )
         self.metadataFileName = self.inputFileNameWithoutExt + ".parquet"
+        # Check the recorded settings before reading any codes
+        header.check_codebook(model)
+        header.check(
+            self.metadataFileName,
+            quantizer,
+            header.codec_name(
+                gzip_compression_level, zlib_compression_level, zstd_compression_level
+            ),
+            self.model.quantizedlen,
+        )
         footer = pq.read_schema(self.metadataFileName).metadata or {}
         self.mzmlHeader = footer.get(HEADER_KEY)
         self.mzmlDefinitions = (
@@ -92,27 +94,37 @@ class SpectrumDecompressor:
                     "stored_raw is not supported for mzML output: raw copies would "
                     "duplicate spectrum ids, which mzML requires to be unique"
                 )
+        self.depacker = compress.BitUnpacker(
+            10,
+            open(self.inputFileName, "rb"),
+            gzip_compression=gzip_compression_level,
+            zlib_compression=zlib_compression_level,
+            zstd_compression=zstd_compression_level,
+        )
         self.MaxValList = []
-        if batch_size is None:
-            Warning("Batch size is not defined; using default batch size of 128")
-            self.batch_size = 128
-        else:
-            self.batch_size = batch_size
+        self.batch_size = 128 if batch_size is None else batch_size
         self.quantizer = quantizer
         self.stored_raw = stored_raw
         # Always process compounded spectra if available for reconstruction
         self.process_compounded = True
         self.compounded_codes_list = []
         self.compounded_idx_list = []  # stays empty without a _compounded.pkl
+        # The compressor only writes this file when some spectra were compounded
         if os.path.exists(self.inputFileNameWithoutExt + "_compounded.pkl"):
             with open(self.inputFileNameWithoutExt + "_compounded.pkl", "rb") as f:
                 self.compounded_idx_list = pickle.load(f)
-        else:
-            Warning(
-                "Compounded file not found, compounded spectra will not be processed"
-            )
 
         self.compounded_original_codes_dict = {}
+
+    def _pull(self):
+        value = self.depacker.pull()
+        if value is None:
+            raise ValueError(
+                f"{self.inputFileName} ended before all codes were read: the file is "
+                "truncated, or --quantizer / the compression method differ from "
+                "the ones used to compress it"
+            )
+        return value
 
     @staticmethod
     def changeSpectrumName(name):
@@ -177,6 +189,12 @@ class SpectrumDecompressor:
 
     # Mode 1: Load All Spectra, then perform decompression
     def DecompressAll(self, verbose=0):
+        try:
+            self._decompress_all(verbose)
+        finally:
+            self.depacker.close()  # also on a truncated or corrupt input
+
+    def _decompress_all(self, verbose):
         """
         Decompress all spectra from compressed format to MGF.
 
@@ -207,14 +225,7 @@ class SpectrumDecompressor:
                 print(f"Extracted codes for {j} spectra...")
             for k in range(self.quantizer):
                 for l in range(self.model.quantizedlen):
-                    try:
-                        all_output_codes[j, k, l] = self.depacker.pull()
-                    except:
-                        traceback.print_exc()
-                        print(
-                            f"Error extracting code for spectrum {j}, quantizer {k}, position {l}"
-                        )
-                        raise
+                    all_output_codes[j, k, l] = self._pull()
 
         # Process all codes in batches
         if verbose >= 1:
@@ -237,7 +248,7 @@ class SpectrumDecompressor:
             for j in range(compounded_indices.shape[0]):
                 for k in range(self.quantizer):
                     for l in range(self.model.quantizedlen):
-                        compounded_codes[j, k, l] = self.depacker.pull()
+                        compounded_codes[j, k, l] = self._pull()
 
             compounded_max_value_list = df_metadata["MaxVal"].values[compounded_indices]
             df_metadata["OriginalIndex"] = range(len(df_metadata))
@@ -360,7 +371,8 @@ class SpectrumDecompressor:
             if "ExtendedMZ" in metaDataBatch.columns:
                 metaDataBatch.pop("ExtendedMZ")
                 metaDataBatch.pop("ExtendedIT")
-            metaDataBatch.pop("OriginalIndex")
+            # Only present when some spectra were compounded
+            metaDataBatch = metaDataBatch.drop(columns="OriginalIndex", errors="ignore")
 
             # Convert batch to MGF format
             for k in range(current_batch_size):
