@@ -12,11 +12,19 @@ it fails on a graph. ``dynamic=False`` keeps shapes static: the ragged last infe
 one extra compile instead of switching to slower dynamic-shape kernels.
 """
 
+import os
+import sysconfig
 import warnings
 
 import torch
 
 COMPILE_MODES = ("none", "default", "max-autotune")
+
+
+def python_headers_available() -> bool:
+    """Triton builds a C helper against Python.h: without it, every compile fails."""
+    include = sysconfig.get_path("include")
+    return os.path.exists(os.path.join(include, "Python.h"))
 
 
 def compile_model(model, mode: str = "none", device=None, force: bool = False):
@@ -36,6 +44,14 @@ def compile_model(model, mode: str = "none", device=None, force: bool = False):
     if device_type != "cuda" and not force:
         warnings.warn(
             f"--compile {mode} ignored on {device_type}: torch.compile is only used on CUDA.",
+            stacklevel=2,
+        )
+        return False
+    if not python_headers_available():
+        # suppress_errors below would otherwise hide this: every graph falls back to eager.
+        warnings.warn(
+            f"--compile {mode} ignored: Python.h is missing, so torch.compile can't build its "
+            "kernels. Install your Python's headers (RHEL: python3-devel).",
             stacklevel=2,
         )
         return False

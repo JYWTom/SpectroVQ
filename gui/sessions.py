@@ -152,12 +152,12 @@ def session_view(job):
     except OSError:
         log = ""
 
-    def newest(suffix):
-        found = [p for p in files if p.suffix == suffix and p.stat().st_size > 0]
+    def newest(*suffixes):
+        found = [p for p in files if p.suffix in suffixes and p.stat().st_size > 0]
         return str(max(found, key=os.path.getmtime)) if found else None
 
     targets = {
-        "mgf": newest(".mgf"),
+        "mgf": newest(".mgf", ".mzML", ".mzml"),
         "vqms2": newest(".vqms2"),
         "ckpt": newest(".ckpt"),
         "resume": session_status(job, meta) in ("paused", "interrupted", "failed")

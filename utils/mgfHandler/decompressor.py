@@ -1,11 +1,21 @@
 from utils.Compression import batchprocessor
 from utils.Compression import compress, header
 from utils.Compression import postprocessing
-from utils.formats import Spectrum, get_writer
+from utils.formats import RunMetadata, Spectrum, get_writer
+from utils.formats.mzml import MzMLWriter
+from utils.formats.mzml_metadata import (
+    COLUMN_PREFIX,
+    COLUMNS_KEY,
+    HEADER_KEY,
+    decode_row,
+    load_definitions,
+)
+import hashlib
 import os
 import torch
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import pickle
 from typing import OrderedDict
 
@@ -60,17 +70,30 @@ class SpectrumDecompressor:
         self.metadataFileName = self.inputFileNameWithoutExt + ".parquet"
         # Check the recorded settings before reading any codes
         header.check_codebook(model)
-        if os.path.exists(self.metadataFileName):
-            header.check(
-                self.metadataFileName,
-                quantizer,
-                header.codec_name(
-                    gzip_compression_level,
-                    zlib_compression_level,
-                    zstd_compression_level,
-                ),
-                self.model.quantizedlen,
-            )
+        header.check(
+            self.metadataFileName,
+            quantizer,
+            header.codec_name(
+                gzip_compression_level, zlib_compression_level, zstd_compression_level
+            ),
+            self.model.quantizedlen,
+        )
+        footer = pq.read_schema(self.metadataFileName).metadata or {}
+        self.mzmlHeader = footer.get(HEADER_KEY)
+        self.mzmlDefinitions = (
+            load_definitions(footer[COLUMNS_KEY]) if COLUMNS_KEY in footer else []
+        )
+        if isinstance(self.writer, MzMLWriter):
+            if self.mzmlHeader is None:
+                raise ValueError(
+                    "This archive has no mzML metadata (it was not compressed from "
+                    "an mzML file), so it can only be decompressed to MGF"
+                )
+            if stored_raw:
+                raise ValueError(
+                    "stored_raw is not supported for mzML output: raw copies would "
+                    "duplicate spectrum ids, which mzML requires to be unique"
+                )
         self.depacker = compress.BitUnpacker(
             10,
             open(self.inputFileName, "rb"),
@@ -130,7 +153,11 @@ class SpectrumDecompressor:
         Format spectrum for MGF output.
 
         """
-        params = {key: metaDataBatchrow[key] for key in metaDataBatchrow.index}
+        params = {
+            key: metaDataBatchrow[key]
+            for key in metaDataBatchrow.index
+            if not key.startswith(COLUMN_PREFIX)
+        }
         if modify_flag:
             params["title"] = self.changeSpectrumName(metaDataBatchrow["title"])
         else:
@@ -140,6 +167,24 @@ class SpectrumDecompressor:
             mz=postprocessing.changeTofloat(list(output_mz)),
             intensity=np.array(list(output_intensity), np.float64),
             params=params,
+            mzml=(
+                decode_row(metaDataBatchrow, self.mzmlDefinitions)
+                if isinstance(self.writer, MzMLWriter)
+                else {}
+            ),
+        )
+
+    def runMetadata(self):
+        """File-level metadata for the writer, or None if the archive has none."""
+        if self.mzmlHeader is None:
+            return None
+        weights = hashlib.sha256()
+        for name, tensor in sorted(self.model.state_dict().items()):
+            weights.update(name.encode())
+            weights.update(tensor.detach().cpu().numpy().tobytes())
+        return RunMetadata(
+            self.mzmlHeader.decode(),
+            {"model sha256": weights.hexdigest(), "quantizers": str(self.quantizer)},
         )
 
     # Mode 1: Load All Spectra, then perform decompression
@@ -344,7 +389,10 @@ class SpectrumDecompressor:
                     compounded = CompoundedSpectrumDict[str(batch_start + k)]
                     ListOfSpectrum.append(
                         Spectrum(
-                            compounded.mz, compounded.intensity, dict(compounded.params)
+                            compounded.mz,
+                            compounded.intensity,
+                            dict(compounded.params),
+                            compounded.mzml,
                         )
                     )
                     if self.stored_raw:
@@ -377,9 +425,9 @@ class SpectrumDecompressor:
             TotalListSpectrum = ListOfSpectrum + ListOfRawSpectrum
             if verbose >= 1:
                 print(f"Number of raw spectra: {len(TotalListSpectrum)}")
-            self.writer.write(TotalListSpectrum)
+            self.writer.write(TotalListSpectrum, self.runMetadata())
         else:
-            self.writer.write(ListOfSpectrum)
+            self.writer.write(ListOfSpectrum, self.runMetadata())
 
         print(f"Decompression completed. Output written to {self.OutputFilePath}")
 

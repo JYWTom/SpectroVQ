@@ -44,7 +44,16 @@ def _check_not_running():
         raise gr.Error("A training run is already in progress.")
 
 
-def train_run(data_path, output_dir, batch_size, lr, max_epochs, num_workers):
+def train_run(
+    data_path,
+    output_dir,
+    batch_size,
+    lr,
+    max_epochs,
+    num_workers,
+    compile_mode,
+    checkpoint_minutes,
+):
     _check_not_running()
     data_path = os.path.expanduser((data_path or "").strip())
     if not data_path or not os.path.exists(data_path):
@@ -63,6 +72,8 @@ def train_run(data_path, output_dir, batch_size, lr, max_epochs, num_workers):
         "learning_rate": lr,
         "max_epochs": int(max_epochs),
         "num_workers": int(num_workers),
+        "compile": compile_mode,
+        "checkpoint_minutes": checkpoint_minutes,
     }
     # The session folder holds the record and log; checkpoints go there too unless an
     # output directory is given.
@@ -107,6 +118,11 @@ def _launch(job, params, resume=False):
         str(params["max_epochs"]),
         "--num_workers",
         str(params["num_workers"]),
+        # Sessions from before these settings existed don't record them.
+        "--compile",
+        params.get("compile", "none"),
+        "--checkpoint_minutes",
+        str(params.get("checkpoint_minutes", 30)),
     ]
     if resume:
         cmd.append("--resume")
@@ -221,6 +237,14 @@ def build(sidebar_outputs):
                     ep = gr.Number(50, precision=0, label="Max epochs")
                     nw = gr.Number(4, precision=0, label="Data loader workers")
                 with gr.Row():
+                    compile_mode = gr.Dropdown(
+                        ["none", "default", "max-autotune"],
+                        value="none",
+                        label="torch.compile",
+                        info="CUDA only",
+                    )
+                    minutes = gr.Number(30, label="Minutes between resume checkpoints")
+                with gr.Row():
                     btn = gr.Button("Start training", variant="primary")
                     pause = gr.Button("Pause (save and exit)")
                     stop = gr.Button("Stop (discard unsaved)", variant="stop")
@@ -230,7 +254,7 @@ def build(sidebar_outputs):
                 ckpts = gr.Markdown()
         btn.click(
             with_session_list(train_run),
-            [data, out, bs, lr, ep, nw],
+            [data, out, bs, lr, ep, nw, compile_mode, minutes],
             [log, ckpts, *sidebar_outputs],
             concurrency_limit=1,
         )

@@ -1,4 +1,4 @@
-"""Decompress tab: .vqms2 + side files -> MGF (MGFDecompressor)."""
+"""Decompress tab: .vqms2 + side files -> MGF or mzML (MGFDecompressor)."""
 
 import os
 from pathlib import Path
@@ -24,6 +24,7 @@ def decompress_run(
     level,
     batch_size,
     stored_raw,
+    out_format,
     ckpt,
     yaml_path,
     device,
@@ -36,7 +37,11 @@ def decompress_run(
     if not os.path.exists(base + ".parquet"):
         raise gr.Error(f"Metadata file not found next to it: {base}.parquet")
     model = load_model(ckpt, yaml_path, device)
-    default_name = f"{Path(vq).stem}_decompressed.mgf"
+    default_name = f"{Path(vq).stem}_decompressed.{out_format}"
+    requested = (out_file or "").strip().lower()
+    wants_mzml = out_format == "mzML" or requested.endswith(".mzml")
+    if wants_mzml and stored_raw:
+        raise gr.Error("Raw reconstructions can only be written to MGF.")
     if (out_file or "").strip():
         export_path(out_file, None, default_name)  # fail before creating a session
     job = new_job_dir(
@@ -47,6 +52,7 @@ def decompress_run(
         level=int(level),
         batch_size=int(batch_size),
         stored_raw=stored_raw,
+        output_format=out_format,
     )
     out_path = export_path(out_file, job, default_name)
 
@@ -116,9 +122,15 @@ def build(model_inputs, sidebar_outputs):
                 raw = gr.Checkbox(
                     False, label="Also write raw (non-chimeric) reconstructions"
                 )
+                out_format = gr.Dropdown(
+                    ["mgf", "mzML"],
+                    value="mgf",
+                    label="Output format",
+                    info="mzML needs an archive compressed from mzML",
+                )
                 outfile, _ = host_file_picker(
                     "Export path on the server",
-                    placeholder="empty = <session folder>/<name>_decompressed.mgf",
+                    placeholder="empty = <session folder>/<name>_decompressed.<format>",
                     folders=True,
                 )
                 btn = gr.Button("Decompress", variant="primary")
@@ -126,7 +138,7 @@ def build(model_inputs, sidebar_outputs):
                 log = gr.Textbox(label="Log", lines=14, max_lines=14, autoscroll=True)
         btn.click(
             with_session_list(decompress_run),
-            [file, outfile, q, method, level, bs, raw, *model_inputs],
+            [file, outfile, q, method, level, bs, raw, out_format, *model_inputs],
             [log, *sidebar_outputs],
             concurrency_id="pipeline",
         )

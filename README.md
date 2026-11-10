@@ -60,6 +60,7 @@ python train.py --data_path library.feather --output_dir ./models --batch_size 3
 - `--resume`: Continue from `<output_dir>/resume/resume.ckpt`
 - `--checkpoint_minutes`: Minutes between resume checkpoints [default: 30]
 - `--accelerator`: Lightning accelerator: `auto`, `cpu`, `cuda` or `mps` [default: auto]
+- `--compile`: `torch.compile` the encoder and decoder: `none`, `default` or `max-autotune` [default: none]
 
 **Pausing and resuming:**
 
@@ -91,7 +92,7 @@ python denoise.py --input_mgf input.mgf --model_path model.ckpt --output_mgf den
 - `--model_path`: Path to trained model checkpoint (.ckpt or .pt file) [required]
 - `--output_mgf`: Path to output denoised MGF file [required]
 - `--yaml_config`: Path to YAML configuration file for model parameters [optional]
-- `--device`: Device to use (cuda or cpu) [default: auto-detect]
+- `--accelerator`: Lightning accelerator: `auto`, `cpu`, `cuda` or `mps`; `--device` is an alias [default: auto]
 - `--num_quantizers`: Number of quantizers to use for denoising [default: 3]
 - `--retain_original_peaks`: Retain original peaks outside the m/z range [default: True]
 - `--no_retain_original_peaks`: Do not retain original peaks outside the m/z range
@@ -102,7 +103,7 @@ python denoise.py --input_mgf input.mgf --model_path model.ckpt --output_mgf den
 - `--num_workers`: Number of workers for processing [default: 0]
 
 ### 3. Compression/Decompression (main.py)
-Compress MS2 spectra (MGF or mzML) to `.vqms2`, or decompress back to MGF. Compression writes `output.vqms2` plus the side files `output.parquet` (metadata) and, when needed, `output_compounded.pkl`; keep them together.
+Compress MS2 spectra (MGF or mzML) to `.vqms2`, or decompress back to MGF or mzML. Only MS2 spectra are supported: MS1 scans in an mzML input are skipped. Compression writes `output.vqms2` plus the side files `output.parquet` (metadata) and, when needed, `output_compounded.pkl`; keep them together.
 
 #### Compression:
 ```bash
@@ -124,12 +125,37 @@ python main.py --decompress --input output.vqms2 --output restored.mgf --weights
 - `--compression_level, -cL`: Level for the coder (gzip/zlib 1-9, zstd 1-22); give it together with `-cM`
 - Decompression must use the same `-cM`, `-cL` and `-q` as compression
 - `--batch_size, -b`: Batch size for processing [optional]
-- `--quantizer, -q`: Quantizer level for compression [default: 4]
+- `--quantizer, -q`: Number of quantizers; must match between compression and decompression [default: 4]
+- `--accelerator`: Lightning accelerator: `auto`, `cpu`, `cuda` or `mps` [default: auto]
+- `--compile`: `torch.compile` the encoder and decoder: `none`, `default` or `max-autotune` [default: none]
 - `--stored_raw, -sR`: Store raw reconstructed spectra [flag]
 
+### 4. Browser GUI (gui.py)
+Runs training, denoising, compression and decompression from a browser.
+
+```bash
+python gui.py --ckpt model.ckpt --compile default
+```
+
+The Compress and Explore tabs accept MGF or mzML, the Decompress tab writes either, and the Train tab can pause, resume and compile a run. Denoising takes MGF only. `--compile` applies to the models the GUI loads, and the Train tab has its own setting. Run `python gui.py --help` for all options.
+
+### torch.compile
+`torch.compile` needs CUDA and your Python's headers (RHEL: `python3-devel`); without them it warns and runs eager. Compiling takes time up front, so it pays off on long runs rather than small files. Compiled output is very close to eager output but not byte-identical.
+
 ## File Formats
-- **Input**: MGF for denoising; MGF or mzML (MS2 scans only) for compression
-- **Compressed Output**: .vqms2 files (SpectroVQ compressed format)
+- **Input**: MGF files for denoising and compression; mzML files for compression. Only MS2 spectra are supported; MS1 is out of scope
+- **Compressed Output**: .vqms2 files (SpectroVQ compressed format) with a .parquet metadata side file
+- **Decompressed Output**: MGF, or mzML for archives compressed from mzML
+
+### mzML metadata
+Compressing an mzML keeps its metadata in the .parquet file: the run header (instrument, software, sample, processing history) in the Parquet footer, and each per-spectrum parameter in its own column. Decompressing to `.mzML` restores it, with these differences from the source:
+- The file has MS2 spectra only, with no MS1 scans or chromatograms, and spectrum `index` values are renumbered from 0. Spectrum ids keep their original scan numbers.
+- Parent scans are recorded with `sourceFileRef` and `externalSpectrumID`, pointing to the source raw file, because `spectrumRef` must resolve within the file.
+- Base peak, total ion current and m/z range are recomputed from the reconstructed peaks.
+- The processing history records the MS1 removal and the lossy reconstruction, including the model hash and quantizer count.
+- Peaks are lossy reconstructions, not the original data.
+
+`--stored_raw` is not supported for mzML output because the raw copies would duplicate spectrum ids. Archives compressed from MGF have no mzML metadata, so they can only be decompressed to MGF.
 - **Model Checkpoints**: .ckpt or .pt files
 - **Training Data**: .feather files (should contain the columns: 'PrecursorMZ', 'CompoundName', 'Comment', 'm/z', 'intensity', 'Charge')
 

@@ -8,6 +8,9 @@ from gradio.components.base import server
 
 from gui.paths import browse_folder
 
+# MGF and mzML in any letter case. The explorer takes one fnmatch pattern, without alternatives.
+SPECTRA_GLOB = "*.[mM][gGzZ]*"
+
 
 class FolderExplorer(gr.FileExplorer):
     """A FileExplorer that lists folders only; expanding one shows a "." entry that picks it."""

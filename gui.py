@@ -89,6 +89,13 @@ def main():
         default=os.environ.get("SPECTROVQ_DATA_DIR", str(config.DATA_DIR)),
         help="Where your sessions (gui_outputs/) and settings are kept (default: ~/.spectrovq)",
     )
+    # Literal, not utils.compile.COMPILE_MODES: that imports torch, and --list must stay fast.
+    parser.add_argument(
+        "--compile",
+        choices=("none", "default", "max-autotune"),
+        default=os.environ.get("SPECTROVQ_COMPILE", "none"),
+        help="torch.compile models loaded for compression, decompression and Explore (CUDA only)",
+    )
     token_group = parser.add_mutually_exclusive_group()
     token_group.add_argument(
         "--token",
@@ -110,6 +117,7 @@ def main():
         return list_servers()
     if args.ckpt:
         os.environ["SPECTROVQ_CKPT"] = args.ckpt
+    os.environ["SPECTROVQ_COMPILE"] = args.compile
     config.BROWSE_ROOT = os.path.abspath(os.path.expanduser(args.root))
 
     token = None if args.no_token else (args.token or make_token())
@@ -133,7 +141,9 @@ def main():
     runtime_file = write_runtime_file(port, url)
     print()
     if token:
-        print("To open the GUI, forward the port and open this URL (it includes your token):")
+        print(
+            "To open the GUI, forward the port and open this URL (it includes your token):"
+        )
         print(f"    ssh -L {port}:localhost:{port} <server>")
         print(f"    {url}")
         if demo.share_url:
@@ -141,7 +151,9 @@ def main():
         print("Run `python gui.py --list` on the server to see this again.")
     else:
         print("WARNING: --no-token: anyone who can reach this port can use the GUI.")
-    print(flush=True)  # show the URL now even when stdout goes to a log file (nohup ... &)
+    print(
+        flush=True
+    )  # show the URL now even when stdout goes to a log file (nohup ... &)
     # `kill` should also remove the runtime file, not just Ctrl-C.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     try:

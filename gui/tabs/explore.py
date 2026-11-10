@@ -6,49 +6,47 @@ from types import SimpleNamespace
 import gradio as gr
 import matplotlib.pyplot as plt
 import numpy as np
-from pyteomics import mgf
 
-from gui.components.file_picker import host_file_picker
+from gui.components.file_picker import SPECTRA_GLOB, host_file_picker
 from gui.config import CODE_BITS, MZ_RANGE
 from gui.model import load_model
 from gui.paths import host_path
 from gui.spectra import (
     cosine,
     count_spectra,
+    is_mzml,
     mirror_plot,
+    read_spectrum,
     reconstruct_vector,
-    spectrum_title,
     spectrum_to_vector,
     vector_peaks,
 )
 
 
-def explore_load(mgf_file):
-    if not (mgf_file or "").strip() or os.path.isdir(
-        os.path.expanduser(mgf_file.strip())
+def explore_load(spectra_file):
+    if not (spectra_file or "").strip() or os.path.isdir(
+        os.path.expanduser(spectra_file.strip())
     ):
-        return gr.update(maximum=1, value=0), "Choose an MGF file.", None
-    path = host_path(mgf_file, "MGF file")
+        return gr.update(maximum=1, value=0), "Choose an MGF or mzML file.", None
+    path = host_path(spectra_file, "spectra file")
     n = count_spectra(path)
     if n == 0:
-        raise gr.Error("No spectra (BEGIN IONS blocks) found in this file.")
+        raise gr.Error("No MS2 spectra found in this file.")
     return (
         gr.update(minimum=0, maximum=max(n - 1, 1), value=0, step=1),
-        f"{n} spectra loaded.",
+        f"{n} MS2 spectra loaded." if is_mzml(path) else f"{n} spectra loaded.",
         path,
     )
 
 
-def explore_run(mgf_path, idx, n_q, ckpt, yaml_path, device):
-    if not mgf_path:
-        raise gr.Error("Choose an MGF file first.")
+def explore_run(spectra_path, idx, n_q, ckpt, yaml_path, device):
+    if not spectra_path:
+        raise gr.Error("Choose an MGF or mzML file first.")
     model = load_model(ckpt, yaml_path, device)
     max_q = int(model.n_q)
     n_q = int(min(max(1, n_q), max_q))
-    with mgf.IndexedMGF(mgf_path) as reader:
-        idx = min(int(idx), len(reader) - 1)
-        spec = reader[idx]
-    mz, it = np.asarray(spec["m/z array"]), np.asarray(spec["intensity array"])
+    mz, it, title = read_spectrum(spectra_path, int(idx))
+    mz, it = np.asarray(mz), np.asarray(it)
     vec, _ = spectrum_to_vector(mz, it)
     if float(vec.sum()) == 0:
         raise gr.Error(
@@ -59,7 +57,6 @@ def explore_run(mgf_path, idx, n_q, ckpt, yaml_path, device):
     recon = reconstruct_vector(model, vec, n_q)
     rec_mz, rec_it = vector_peaks(recon)
     in_mz, in_it = vector_peaks(target)
-    title = spectrum_title(spec, int(idx))
     fig = mirror_plot(
         in_mz,
         in_it,
@@ -118,7 +115,9 @@ def build(model_inputs):
         with gr.Row():
             with gr.Column(scale=1):
                 file, on_pick = host_file_picker(
-                    "MGF path on the server", "*.mgf", "/path/to/spectra.mgf"
+                    "MGF or mzML path on the server",
+                    SPECTRA_GLOB,
+                    "/path/to/spectra.mgf",
                 )
                 info = gr.Markdown()
                 idx = gr.Slider(0, 1, value=0, step=1, label="Spectrum index")

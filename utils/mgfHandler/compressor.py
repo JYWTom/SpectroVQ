@@ -9,6 +9,7 @@ import pyarrow.parquet as pq
 
 from ..Compression import compress, header, torchprocessor
 from ..formats import get_reader
+from ..formats.mzml_metadata import COLUMNS_KEY, HEADER_KEY, encode_columns
 
 DEFAULTMGFPARAMSKEYS = [
     "title",
@@ -107,19 +108,47 @@ class SpectrumCompressor:
             df_meta["ExtendedMZ"] = self.ExtendedMzList
             df_meta["ExtendedIT"] = self.ExtendedIntensityList
         df_meta.pop("pepmass")
-        # Record what decoding needs; the code stream itself has no header
         table = pa.Table.from_pandas(df_meta)
+        # Parquet settings apply per leaf, and a list column's leaf has its own path.
+        leaves = [
+            f"{field.name}.list.element" if pa.types.is_list(field.type) else field.name
+            for field in table.schema
+        ]
+        compression = dict.fromkeys(leaves, "gzip")
+        levels = (
+            dict.fromkeys(leaves, self.parquet_compression_level)
+            if self.parquet_compression_level is not None
+            else {}
+        )
+        run = self.reader.run_metadata()
+        if run is not None:
+            columns, definitions = encode_columns(self.mzmlList)
+            for name, array in columns.items():
+                table = table.append_column(name, array)
+                # zstd: these columns are far smaller than gzip at the same effort.
+                compression[name] = "zstd"
+                levels[name] = 19
+            table = table.replace_schema_metadata(
+                {
+                    **(table.schema.metadata or {}),
+                    HEADER_KEY: run.header.encode(),
+                    COLUMNS_KEY: definitions,
+                }
+            )
+        # Record what decoding needs; the code stream itself has no header
         settings = header.make(
             self.quantizer,
             self.packer.compression_type or "none",
             self.model.quantizedlen,
         )
-        table = table.replace_schema_metadata({**table.schema.metadata, **settings})
+        table = table.replace_schema_metadata(
+            {**(table.schema.metadata or {}), **settings}
+        )
         pq.write_table(
             table,
             self.metadataFileName,
-            compression="gzip",
-            compression_level=self.parquet_compression_level,
+            compression=compression,
+            compression_level=levels,
         )
 
     # Mode 1: Load all spectra into MEMORY, then perform compression
@@ -134,6 +163,7 @@ class SpectrumCompressor:
         mzList = [sp.mz for sp in spectra]
         intensityList = [sp.intensity for sp in spectra]
         paramList = [sp.params for sp in spectra]
+        self.mzmlList = [sp.mzml for sp in spectra]
         self.mzList = mzList
         self.intensityList = intensityList
         self.paramList = paramList

@@ -25,7 +25,7 @@ argparser.add_argument(
     "-i",
     type=str,
     required=True,
-    help="Input file path (.mgf, or .vqms2 when decompressing)",
+    help="Input file path (.mgf or .mzML, or .vqms2 when decompressing)",
 )
 argparser.add_argument(
     "--output",
@@ -33,7 +33,8 @@ argparser.add_argument(
     type=str,
     required=True,
     help="Compress: output path (.vqms2 added if missing; .parquet and "
-    "_compounded.pkl are written next to it). Decompress: output spectra file",
+    "_compounded.pkl are written next to it). Decompress: .mgf or .mzML "
+    "(.mzML needs an archive compressed from mzML)",
 )
 argparser.add_argument(
     "--weights", "-w", type=str, required=True, help="Path to model weights"
@@ -60,7 +61,7 @@ argparser.add_argument(
     "-q",
     type=int,
     default=4,
-    help="Number of quantizers (default 4). Decompression must use the same value.",
+    help="Number of quantizers; must match between compression and decompression (default: 4)",
 )
 argparser.add_argument(
     "--stored_raw", "-sR", action="store_true", help="Store raw reconstructed spectra"
