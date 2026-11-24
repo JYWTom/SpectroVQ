@@ -1,3 +1,11 @@
 #Python-related cache files
 */__pycache__/*
 *.pyc
+
+# Machine-specific GUI settings (last loaded model paths)
+gui_config.json
+gui_outputs
+models
+.*
+# Type stubs Gradio generates next to custom components (FolderExplorer)
+gui/components/*.pyi
