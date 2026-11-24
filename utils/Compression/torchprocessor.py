@@ -1,8 +1,30 @@
-from torch.utils.data import Dataset, DataLoader
+from dataclasses import dataclass, field
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, Dataset
+
+from ..config import BIN_SIZE, SPECTRA_DIMENSION
 from ..SpectrumProcessing import SpectraLoading
 from .preprocessing import rescaleSpectra
-import torch
-import numpy as np
+
+
+@dataclass
+class EncodeResult:
+    """Output of ``SpectrumTorchBatchEncoder.getReconstructIndices``.
+
+    Fields that were not requested stay empty, so callers never branch on
+    which flags were set.
+    """
+
+    codes: torch.Tensor  # N_q x B x D codebook indices
+    max_vals: list = field(default_factory=list)  # per spectrum, B
+    # Second-pass codes for spectra whose residual was re-encoded, and their indices
+    compounded_codes: list = field(default_factory=list)
+    compounded_idx: list = field(default_factory=list)
+    # Peaks outside the model's m/z range, stored verbatim; one array per spectrum
+    extended_mz: list = field(default_factory=list)
+    extended_it: list = field(default_factory=list)
 
 class SpectrumBatch(Dataset):
     def __init__(self, mzList,intensityList):
@@ -14,9 +36,21 @@ class SpectrumBatch(Dataset):
         return self.length
 
     def __getitem__(self, idx):
-        MSspectra,MaxVal = SpectraLoading.massSpectrumToVector(self.Xmz[idx],self.Xintensity[idx], bin_size = 0.1,SPECTRA_DIMENSION=13500,rawIT = False,Mode = None,mean0 = False,CenterIntegerBins=False,AlterMZ=False
-                                        ,GenerateMZList=False,MZDiff = False,mzRange = [150,1500])
-        return torch.sqrt(torch.unsqueeze(MSspectra,dim = 0)),MaxVal
+        MSspectra, MaxVal = SpectraLoading.massSpectrumToVector(
+            self.Xmz[idx],
+            self.Xintensity[idx],
+            bin_size=BIN_SIZE,
+            SPECTRA_DIMENSION=SPECTRA_DIMENSION,
+            rawIT=False,
+            Mode=None,
+            mean0=False,
+            CenterIntegerBins=False,
+            AlterMZ=False,
+            GenerateMZList=False,
+            MZDiff=False,
+            mzRange=[150, 1500],
+        )
+        return torch.sqrt(torch.unsqueeze(MSspectra, dim=0)), MaxVal
 
 
 class SpectrumTorchBatchEncoder():
@@ -37,17 +71,23 @@ class SpectrumTorchBatchEncoder():
     def getReconstructIndices(self,outputOutOfRange = False,quantizer = 6,batch_size = 128, num_workers = 16):
         DataLoaderBatch = DataLoader(self.dataset,batch_size = batch_size,shuffle = False,num_workers = num_workers,drop_last = False)
         CodeList = []
-        if outputOutOfRange:
-            extendedmz,extendedit = [], []
+        extendedmz, extendedit = [], []
         with torch.no_grad():
             for batchidx, (inputBatch, MaxVal) in enumerate(DataLoaderBatch):
                 self.MaxValList.extend(MaxVal.numpy().tolist())
                 inputBatch = inputBatch.to(self.device)
                 sqinputBatch = torch.square(inputBatch)
+                # Encode once; the chimeric check decodes from the same embedding instead of re-running the encoder
+                embedding, codes, _, _ = self.model.encode(
+                    inputBatch,
+                    returnCodebookIndices=True,
+                    returnAll=True,
+                    numquantizer=quantizer,
+                )
                 if self.compounded:
                     # Process the output spectra
-                    output_spectra, _,_ = self.model.forwardWithnumQuantizers(inputBatch,quantizer)
-                    output_spectra = rescaleSpectra(output_spectra,dim = 2)
+                    output_spectra = self.model.decodeLatent(embedding)
+                    output_spectra = rescaleSpectra(output_spectra, dim=2)
                     output_spectra = torch.square(output_spectra)
                     output_spectra = torch.where(output_spectra < 1e-3,torch.zeros_like(output_spectra),output_spectra)
                     # Calculate the peaks portion
@@ -59,7 +99,6 @@ class SpectrumTorchBatchEncoder():
                         if NumberOfPeaksPortion[i] < 0.5:
                             self.compoundedCodes.append(ChimericCodes[:,i,:])
                             self.compoundedCodesIdx.append(i + (batchidx * batch_size))
-                _, codes, _, _ = self.model.encode(inputBatch,returnCodebookIndices = True,returnAll = True,numquantizer = quantizer)
                 CodeList.append(codes.cpu())
 
                 if outputOutOfRange:
@@ -70,14 +109,14 @@ class SpectrumTorchBatchEncoder():
                         extendedit.append(original_intensity[missingidx])
 
                 if self.verbose >= 1 and batchidx % 500 == 0:
-                    print(f'Processed batch {batchidx + 1}/{len(DataLoaderBatch)}')
-            finalCode = torch.concat(CodeList,dim = 1)
-            
-        if (self.compounded) & (outputOutOfRange):
-            return finalCode,self.compoundedCodes, self.compoundedCodesIdx,extendedmz,extendedit
-        else:
-            if self.compounded:
-                return finalCode,self.compoundedCodes, self.compoundedCodesIdx, 'dummy'
-            if outputOutOfRange:
-                return finalCode,extendedmz,extendedit
-        return finalCode
+                    print(f"Processed batch {batchidx + 1}/{len(DataLoaderBatch)}")
+            finalCode = torch.concat(CodeList, dim=1)
+
+        return EncodeResult(
+            codes=finalCode,
+            max_vals=list(self.MaxValList),
+            compounded_codes=list(self.compoundedCodes),
+            compounded_idx=list(self.compoundedCodesIdx),
+            extended_mz=extendedmz,
+            extended_it=extendedit,
+        )

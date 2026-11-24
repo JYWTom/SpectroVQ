@@ -1,10 +1,38 @@
-from . import modelStream
+from typing import Any
+
 import torch
 import yaml
-DEFAULTPARAMS = {'inputChannel': 1, 'n_q':12, 'n_filters': 32,'n_residual_layers': 1, 'lstm': 0, 'ratios':[9,7,4,2] , 'final_activation': 'Sigmoid',
-                'residual_kernel_size': 6,'codebook_size':1024, 'FiLMEncoder' : False, 'FiLMDecoder' :False,'flattenQuantization' : False,
-                'quantizationdim': 256, 'biLSTM': False,'causal':False,'useQINCo':False,'inputSize' : 13500,'dimension':256,'kernel_size':8, 
-                'encoders':False,'bucketTransform':False,'applyquantizerdroput':False,'transformer':6}
+
+from . import modelStream
+from ..config import SPECTRA_DIMENSION
+
+DEFAULTPARAMS: dict[str, Any] = {
+    "inputChannel": 1,
+    "n_q": 12,
+    "n_filters": 32,
+    "n_residual_layers": 1,
+    "lstm": 0,
+    "ratios": [9, 7, 4, 2],
+    "final_activation": "Sigmoid",
+    "residual_kernel_size": 6,
+    "codebook_size": 1024,
+    "FiLMEncoder": False,
+    "FiLMDecoder": False,
+    "flattenQuantization": False,
+    "quantizationdim": 256,
+    "biLSTM": False,
+    "causal": False,
+    "useQINCo": False,
+    "inputSize": SPECTRA_DIMENSION,
+    "dimension": 256,
+    "kernel_size": 8,
+    "encoders": False,
+    "bucketTransform": False,
+    "applyquantizerdroput": False,
+    "transformer": 6,
+}
+
+
 def getModel(yaml_file=None):
     '''
     Load the model from the yaml file
@@ -13,6 +41,7 @@ def getModel(yaml_file=None):
     yaml_file (str): The path to the yaml file; if None, the default parameters are used
     weights_file (str): The path to the weights file; if None, the weights will not be loaded
     '''
+    model_kwargs: dict[str, Any]
     if yaml_file is None:
         model_kwargs = DEFAULTPARAMS
         
@@ -31,8 +60,7 @@ def ApplyWeights(model,weights_file):
     model (torch.nn.Module): The model to which the weights will be applied
     weights_file (str): The path to the weights file; if None, the weights will not be loaded
     '''
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    weights = torch.load(weights_file, map_location = device)
+    weights = torch.load(weights_file, map_location="cpu")
     weights_dict = {}
     for k, v in weights['state_dict'].items():
         new_k = k.replace('_orig_mod.', '') # from a torch.compile wrapper

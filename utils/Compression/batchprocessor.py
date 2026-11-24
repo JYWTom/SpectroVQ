@@ -1,3 +1,4 @@
+from ..config import BIN_SIZE, MZ_RANGE
 from ..SpectrumProcessing import SpectraLoading
 from .preprocessing import rescaleSpectra
 import torch
@@ -78,7 +79,15 @@ class SpectrumBatchDecoder():
         """
         output_mzList,output_intensityList = [],[]
         for j in range(spectrum.shape[0]):
-            output_mz,output_intensity = SpectraLoading.VectorToMassSpectrum(spectrum[j,:],self.MaxValList[j],bin_size = 0.1,threshold = 1e-4,min_mz = 150,AlterMZ=False,returnNumpy=True)#1e-3
+            output_mz, output_intensity = SpectraLoading.VectorToMassSpectrum(
+                spectrum[j, :],
+                self.MaxValList[j],
+                bin_size=BIN_SIZE,
+                threshold=1e-4,
+                min_mz=MZ_RANGE[0],
+                AlterMZ=False,
+                returnNumpy=True,
+            )  # 1e-3
             output_intensity = list(output_intensity.astype(np.float32))
             output_mz = list(np.round(output_mz.astype(np.float32)+ 0.055 ,6))
             if len(self.leftmzList) > 0:

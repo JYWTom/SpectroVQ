@@ -1,44 +1,44 @@
-import torch
-import pandas as pd
-import os
-import numpy as np
-import math
-from torch.utils.data import Dataset, DataLoader
-from utils.SpectrumProcessing.SpectraLoading import massSpectrumToVector
-import torch
-import torch.nn as nn
-import lightning as L
-from lightning.pytorch import seed_everything
-import numpy as np
 import argparse
+import json
+import math
+import os
 import sys
-from utils.model import modelStream
-from utils.compile import COMPILE_MODES, compile_model
+from datetime import timedelta
+from pathlib import Path
+from typing import Any
+
+import lightning as L
+import numpy as np
+import pandas as pd
+import torch
+from lightning.fabric.accelerators import CUDAAccelerator
+from lightning.pytorch import seed_everything
+from lightning.pytorch.callbacks import Callback, ModelCheckpoint
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
-from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.utilities.exceptions import SIGTERMException
+from torch import nn
 from torch.optim import AdamW
+from torch.utils.data import DataLoader, Dataset, Sampler
 from transformers import get_cosine_schedule_with_warmup
 
-parser = argparse.ArgumentParser(description = 'Training script for SpectroVQ')
-parser.add_argument('--data_path', type=str, default='library.feather',help = 'data path to the consensus library file (.feather)')
-parser.add_argument('--output_dir', type=str, default='.',help = 'output directory for the trained model')
-parser.add_argument('--batch_size', type=int, default=32,help = 'batch size for training')
-parser.add_argument('--num_workers', type=int, default=4,help = 'number of workers for data loading')
+from utils import config
+from utils.compile import compile_model
+from utils.config import BIN_SIZE, MZ_RANGE, SPECTRA_DIMENSION
+from utils.device import resolve_device
+from utils.model import modelStream
+from utils.resume import EXIT_PAUSED, ResumeError, ResumeStore, library_fingerprint
+from utils.session_cli import (
+    add_background_argument,
+    add_compile_argument,
+    existing_session,
+    run_session,
+)
+from utils.sessions import RESUME_SETTINGS, read_job, update_job
+from utils.SpectrumProcessing.SpectraLoading import massSpectrumToVector
 
-# Model hyperparameters
-parser.add_argument('--learning_rate', type=float, default=1e-4, help='learning rate for training')
-parser.add_argument('--max_epochs', type=int, default=50, help='maximum number of training epochs')
-parser.add_argument('--compile', choices=COMPILE_MODES, default='none', help='torch.compile the encoder and decoder (CUDA only; the quantizer stays eager)')
 
-args = parser.parse_args()
-output_dir = args.output_dir
-data_path = args.data_path
-
-seed_everything(42, workers=True)
-torch.set_float32_matmul_precision("high")
-
-def PreprocessData():
-    print('Loading Training Data ....')
+def PreprocessData(data_path):
+    print("Loading Training Data ....")
     df_train = pd.read_feather(data_path)
     df_train = df_train.rename(columns={'Name':'CompoundName','Annotation':'Peak Comments'})
     df_train['Charge'] = df_train['CompoundName'].str.extract(r'(\d+)$').astype(int)
@@ -70,11 +70,16 @@ def PreprocessData():
 def transformToTensor(x):
     return torch.from_numpy(np.array(x.to_list(),dtype='float32'))
 
-Bin_size = 0.1
-class SpectrumAugmentation():
-    def __init__(self,seed = 10,returntype = 'torch'):
-        self.randomizer = np.random.default_rng(seed=seed)
-        if returntype == 'torch':
+# Fixed, also on resume: every data order and augmentation below derives from it.
+BASE_SEED = 42
+
+
+class SpectrumAugmentation:
+    """Spectrum noise. Every method draws from the generator it is given (see
+    SpectrumBatch.__getitem__), so the noise of a sample does not depend on earlier samples."""
+
+    def __init__(self, returntype="torch"):
+        if returntype == "torch":
             self.returntype = torch.from_numpy
         elif returntype == 'numpy':
             self.returntype = None
@@ -88,48 +93,49 @@ class SpectrumAugmentation():
         '''
         return np.convolve(x, np.ones(w), 'valid') / w
 
-    def AddGausianNoise(self,x):
-        '''
+    def AddGausianNoise(self, x, rng):
+        """
         x: input signal
-        '''
-        return x + self.randomizer.normal(0, 0.001, size=x.shape)
+        rng: numpy random generator
+        """
+        return x + rng.normal(0, 0.001, size=x.shape)
 
-    def ModifyMZ(self,mz):
-        MZModified = self.randomizer.binomial(len(mz),0.25)
-        Changeidx = self.randomizer.integers(low= 0, high = len(mz), size = MZModified)
+    def ModifyMZ(self, mz, rng):
+        MZModified = rng.binomial(len(mz), 0.25)
+        Changeidx = rng.integers(low=0, high=len(mz), size=MZModified)
         for i in Changeidx:
-            mz[i] = mz[i] + self.randomizer.normal(0,0.01)
+            mz[i] = mz[i] + rng.normal(0, 0.01)
         return mz
 
-    def ApplyMovingAverage(self,x):
-        MovingAverage = self.randomizer.binomial(len(x),0.5)
-        Changeidx = self.randomizer.integers(low= 0, high = len(x)-11, size = MovingAverage)
+    def ApplyMovingAverage(self, x, rng):
+        MovingAverage = rng.binomial(len(x), 0.5)
+        Changeidx = rng.integers(low=0, high=len(x) - 11, size=MovingAverage)
         for u in Changeidx:
             if (x[u] == 0) & (x[u+1] == 0):
                 continue
             else:
                 x[u:u+11] = self.MovingAverage(x[u:u+11],w = 11)
         return x
-    
-    def AddPeriodicPeaks(self,x):
-        NoisePeakWavelength = self.randomizer.random(x.shape[0])
-        magnitude = self.randomizer.gamma(1,0.001, x.shape[0])
-        temp = np.linspace(0,10,x.shape[0])
-        periodicPeaks = (np.sin(2*np.pi*NoisePeakWavelength*temp)+1)*magnitude
+
+    def AddPeriodicPeaks(self, x, rng):
+        NoisePeakWavelength = rng.random(x.shape[0])
+        magnitude = rng.gamma(1, 0.001, x.shape[0])
+        temp = np.linspace(0, 10, x.shape[0])
+        periodicPeaks = (np.sin(2 * np.pi * NoisePeakWavelength * temp) + 1) * magnitude
         return x + periodicPeaks
 
-    def AddRandomPeaks(self,x,lambdaPoisson = 1):
+    def AddRandomPeaks(self, x, rng, lambdaPoisson=1):
         # Generate simulated electronic noises
-        NumberNoisePeaks = self.randomizer.integers(1,150)
-        Position = self.randomizer.integers(low= 0, high = x.shape[-1], size = NumberNoisePeaks)
+        NumberNoisePeaks = rng.integers(1, 150)
+        Position = rng.integers(low=0, high=x.shape[-1], size=NumberNoisePeaks)
         # Generating Poisson-distributed random variables
-        intensity = np.random.poisson(lam=lambdaPoisson, size=NumberNoisePeaks)
-        intensity = intensity/100
+        intensity = rng.poisson(lam=lambdaPoisson, size=NumberNoisePeaks)
+        intensity = intensity / 100
         for i in range(NumberNoisePeaks):
             x[Position[i]] += intensity[i]
         return x
 
-randomAugmentizer = np.random.default_rng(seed=42)
+
 class SpectrumBatch(Dataset):
     def __init__(self, df):
         df.sort_values(by = 'PrecursorMZ',inplace = True)
@@ -141,52 +147,120 @@ class SpectrumBatch(Dataset):
         self.PrecursorMz = df['PrecursorMZ']
         self.PrecursorMz = self.PrecursorMz.apply(lambda x: float(x))
         self.length = df.shape[0]
-        self.base_seed = 42
-        self.Augmentation = SpectrumAugmentation(seed = self.base_seed,returntype = 'torch')
-        self.applyAugmentationRNG = np.random.default_rng(seed=self.base_seed)
+        self.base_seed = BASE_SEED
+        self.epoch = 0  # set before each epoch's workers start; part of the sample seed
+        self.Augmentation = SpectrumAugmentation(returntype="torch")
 
     def __len__(self):
         return self.length
-    
-    def reset_rng(self):
-        self.applyAugmentationRNG = np.random.default_rng(seed=self.base_seed + randomAugmentizer.integers(0,1000))
-        self.Augmentation = SpectrumAugmentation(seed = self.base_seed + randomAugmentizer.integers(0,1000),returntype = 'torch')
-    
-    def set_epoch(self):
-        self.reset_rng()
-    
-    def __getitem__(self, idx):
-        mz,it = self.Xmz.iloc[idx],self.Xintensity.iloc[idx]
-        precursormz = self.PrecursorMz.iloc[idx]
+
+    def __getitem__(self, index):
+        # Per sample, so a sample's augmentation doesn't depend on which worker loads it or
+        # on what was loaded before it, and a resumed epoch can start anywhere.
+        rng = np.random.default_rng([self.base_seed, self.epoch, index])
+        mz, it = self.Xmz.iloc[index], self.Xintensity.iloc[index]
+        precursormz = self.PrecursorMz.iloc[index]
         # Peak Masking
-        delete_mask = self.applyAugmentationRNG.binomial(1,0.1,size = len(mz))
+        delete_mask = rng.binomial(1, 0.1, size=len(mz))
         mz = mz[delete_mask == 0]
         it = it[delete_mask == 0]
-        spectra, _ = massSpectrumToVector(self.Xmz.iloc[idx],self.Xintensity.iloc[idx], bin_size = Bin_size,SPECTRA_DIMENSION=13500,rawIT = False,Mode = None,mean0 = False,CenterIntegerBins=False,AlterMZ=False
-                                           ,GenerateMZList=False,MZDiff = False,mzRange = [150,1500])
-        augmentedSpectra,_ = massSpectrumToVector(mz,it, bin_size = Bin_size,SPECTRA_DIMENSION=13500,rawIT = False,Mode = None,mean0 = False,CenterIntegerBins=False,AlterMZ=False
-                                           ,GenerateMZList=False,MZDiff = False,mzRange = [150,1500],returntorch=False)
+        spectra, _ = massSpectrumToVector(
+            self.Xmz.iloc[index],
+            self.Xintensity.iloc[index],
+            bin_size=BIN_SIZE,
+            SPECTRA_DIMENSION=SPECTRA_DIMENSION,
+            rawIT=False,
+            Mode=None,
+            mean0=False,
+            CenterIntegerBins=False,
+            AlterMZ=False,
+            GenerateMZList=False,
+            MZDiff=False,
+            mzRange=MZ_RANGE,
+        )
+        augmentedSpectra, _ = massSpectrumToVector(
+            mz,
+            it,
+            bin_size=BIN_SIZE,
+            SPECTRA_DIMENSION=SPECTRA_DIMENSION,
+            rawIT=False,
+            Mode=None,
+            mean0=False,
+            CenterIntegerBins=False,
+            AlterMZ=False,
+            GenerateMZList=False,
+            MZDiff=False,
+            mzRange=MZ_RANGE,
+            returntorch=False,
+        )
         # Electronic Noises
-        if self.applyAugmentationRNG.binomial(1,0.5):
-            augmentedSpectra = self.Augmentation.AddRandomPeaks(augmentedSpectra,lambdaPoisson = 5)
+        if rng.binomial(1, 0.5):
+            augmentedSpectra = self.Augmentation.AddRandomPeaks(
+                augmentedSpectra, rng, lambdaPoisson=5
+            )
         # Peptide Noises
-        if self.applyAugmentationRNG.binomial(1,0.5):
+        if rng.binomial(1, 0.5):
             currentPrecursorMz = precursormz
-            mixupMz = self.applyAugmentationRNG.uniform(currentPrecursorMz - 5,currentPrecursorMz + 5)# 5 Th Tolerance
+            mixupMz = rng.uniform(
+                currentPrecursorMz - 5, currentPrecursorMz + 5
+            )  # 5 Th Tolerance
             mixupidx = np.argmin(np.abs(self.PrecursorMz - mixupMz))
             N = 0
-            while mixupidx == idx:
-                mixupMz = self.applyAugmentationRNG.uniform(currentPrecursorMz - 5,currentPrecursorMz + 5)# 5 Th Tolerance
+            while mixupidx == index:
+                mixupMz = rng.uniform(
+                    currentPrecursorMz - 5, currentPrecursorMz + 5
+                )  # 5 Th Tolerance
                 mixupidx = np.argmin(np.abs(self.PrecursorMz - mixupMz))
                 N += 1
                 if N > 10:
                     break
-            mixupidx = np.clip(mixupidx,a_min=0,a_max=self.length-1)
-            mixupSpectra,_ = massSpectrumToVector(self.Xmz.iloc[mixupidx],self.Xintensity.iloc[mixupidx], bin_size = Bin_size,SPECTRA_DIMENSION=13500,rawIT = False,Mode = None,mean0 = False,CenterIntegerBins=False,AlterMZ=False
-                                           ,GenerateMZList=False,MZDiff = False,mzRange = [150,1500],returntorch=False)
-            mix = self.applyAugmentationRNG.uniform(0.1,0.5,size = 1)
-            augmentedSpectra = np.clip((augmentedSpectra* (1-mix) + mixupSpectra*mix),a_min=0,a_max=1)
-        return torch.unsqueeze(torch.sqrt(spectra),dim = 0), torch.unsqueeze(torch.sqrt(torch.from_numpy(augmentedSpectra)),0).float()
+            mixupidx = np.clip(mixupidx, a_min=0, a_max=self.length - 1)
+            mixupSpectra, _ = massSpectrumToVector(
+                self.Xmz.iloc[mixupidx],
+                self.Xintensity.iloc[mixupidx],
+                bin_size=BIN_SIZE,
+                SPECTRA_DIMENSION=SPECTRA_DIMENSION,
+                rawIT=False,
+                Mode=None,
+                mean0=False,
+                CenterIntegerBins=False,
+                AlterMZ=False,
+                GenerateMZList=False,
+                MZDiff=False,
+                mzRange=MZ_RANGE,
+                returntorch=False,
+            )
+            mix = rng.uniform(0.1, 0.5, size=1)
+            augmentedSpectra = np.clip(
+                (augmentedSpectra * (1 - mix) + mixupSpectra * mix), a_min=0, a_max=1
+            )
+        return torch.unsqueeze(torch.sqrt(spectra), dim=0), torch.unsqueeze(
+            torch.sqrt(torch.from_numpy(augmentedSpectra)), 0
+        ).float()
+
+
+class ResumableSampler(Sampler):
+    """Shuffles from (seed, epoch) alone, and can start an epoch after its finished batches
+    by index, so no data is loaded to skip them."""
+
+    def __init__(self, dataset, batch_size, seed=BASE_SEED):
+        self.dataset, self.batch_size, self.seed = dataset, batch_size, seed
+        self.epoch, self.skip_batches = 0, 0
+
+    def set_epoch(self, epoch):  # called by Lightning before each epoch
+        # The dataset is copied to the workers when they start: persistent_workers must stay off.
+        self.epoch = self.dataset.epoch = epoch
+
+    def __iter__(self):
+        g = torch.Generator().manual_seed(self.seed + self.epoch)
+        order = torch.randperm(len(self.dataset), generator=g).tolist()
+        skip, self.skip_batches = self.skip_batches, 0
+        return iter(order[skip * self.batch_size :])
+
+    def __len__(self):
+        # The full epoch, so Lightning's batch count stays stable.
+        return len(self.dataset)
+
 
 eps = 1e-6
 cos2 = nn.CosineSimilarity(dim=2, eps=1e-6)
@@ -228,9 +302,12 @@ def peak_portion(input, target,dim = 2):
 weightCS, weightSE = 1.0, 1.0
 NAN_CHECK_EVERY = 100  # training steps between NaN checks of the loss
 class LightningModelSpectraStream(L.LightningModule):
-    def __init__(self, model,learning_rate,len_train_loader,len_test_loader):
+    def __init__(
+        self, model, learning_rate, len_train_loader, len_test_loader, max_epochs
+    ):
         super().__init__()
         self.model = model
+        self.max_epochs = max_epochs
         self.len_train_loader = len_train_loader
         self.len_test_loader = len_test_loader
         self.learning_rate = learning_rate
@@ -252,10 +329,10 @@ class LightningModelSpectraStream(L.LightningModule):
 
         if batch_idx % 5000 == 0:
             print(".", end="")
-            print('Training Loss: {}'.format(loss.item()))
-            print('SpectralConstrastiveLoss: {}'.format(OrigCosineLoss.item()))
-            print('QuantizeLoss: {}'.format(QuantizeLoss.item()))
-            print('SELoss: {}'.format(SE_Loss.item()))
+            print(f"Training Loss: {loss.item()}")
+            print(f"SpectralConstrastiveLoss: {OrigCosineLoss.item()}")
+            print(f"QuantizeLoss: {QuantizeLoss.item()}")
+            print(f"SELoss: {SE_Loss.item()}")
 
         # Checking for NaN every step would force a host sync; check in groups instead.
         self._pending_train_losses.append(loss.detach())
@@ -270,11 +347,13 @@ class LightningModelSpectraStream(L.LightningModule):
         self._pending_train_losses.clear()
         n_nan = int(torch.isnan(losses).sum())
         if n_nan:
-            print('NAN Loss Detected in {} training batches up to batch {}'.format(n_nan, batch_idx))
+            print(
+                f"NAN Loss Detected in {n_nan} training batches up to batch {batch_idx}"
+            )
 
     def validation_step(self, batch, batch_idx):
 
-        spectra, aug_spectra = batch
+        spectra, _ = batch
 
         output, _, _ = self.model(spectra)
 
@@ -286,81 +365,402 @@ class LightningModelSpectraStream(L.LightningModule):
         loss = OrigCosineLoss + SE_Loss
 
         if batch_idx % 100 == 0:
-            print('Testing Loss: {}'.format(loss.item()))
-            print('SpectralConstrastiveLoss: {}'.format(OrigCosineLoss.item()))
-            print('SELoss: {}'.format(SE_Loss.item()))
+            print(f"Testing Loss: {loss.item()}")
+            print(f"SpectralConstrastiveLoss: {OrigCosineLoss.item()}")
+            print(f"SELoss: {SE_Loss.item()}")
 
         if torch.isnan(loss):
-            print('NAN Loss Detected at Testing batch {}'.format(batch_idx))
+            print(f"NAN Loss Detected at Testing batch {batch_idx}")
         else:
             self.AverageTestLossList.append(loss.item())
         self.log("val_loss", loss, sync_dist=True, on_epoch=True)
 
     def on_train_epoch_end(self):
         self._check_train_losses(self.trainer.global_step)
-        self.trainer.train_dataloader.dataset.set_epoch()
-        self.rng = np.random.default_rng(42 + self.rng.integers(0,1000))
-        return 
-    
+        self.rng = np.random.default_rng(42 + int(self.rng.integers(0, 1000)))
+
     def on_validation_epoch_end(self):
         AverageTLoss = np.mean(self.AverageTestLossList)
         self.log("val_mean_loss", AverageTLoss,sync_dist = True)
         self.AverageTestLossList.clear()
-        self.trainer.val_dataloaders.dataset.set_epoch()
-        return 
-    
+        val_loader = self.trainer.val_dataloaders
+        assert val_loader is not None  # this hook only runs when validating
+        # Not for the sanity check: Lightning skips it when it resumes mid-epoch but runs it when
+        # it resumes at an epoch boundary, which would shift the validation augmentation of a
+        # resumed run by one epoch.
+        if not self.trainer.sanity_checking:
+            val_loader.dataset.epoch += 1
+
     def configure_optimizers(self):
         warmup_epochs = 7
-        total_epochs = 50
+        total_epochs = self.max_epochs
         optimizer = AdamW(self.model.parameters(), lr=self.learning_rate)
         num_train_optimization_steps = total_epochs * self.len_train_loader
         num_warmup_steps = warmup_epochs * self.len_train_loader
-        lr_scheduler = {'scheduler': get_cosine_schedule_with_warmup(optimizer,
-                                                    num_warmup_steps=num_warmup_steps,
-                                                    num_training_steps=num_train_optimization_steps),
-                        'name': 'learning_rate',
-                        'interval':'step',
-                        'frequency': 1}
-        return {"optimizer": optimizer,"lr_scheduler": lr_scheduler}
-from torch.utils.data import DataLoader
-if torch.cuda.is_available():
-    print("CUDA is available!")
-    device = torch.device("cuda")
-    torch.backends.cudnn.benchmark=True 
-else:
-    print("CUDA is not available.")
-    device = torch.device("cpu")
-
-print('Starting Training Program')
+        lr_scheduler = {
+            "scheduler": get_cosine_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=num_warmup_steps,
+                num_training_steps=num_train_optimization_steps,
+            ),
+            "name": "learning_rate",
+            "interval": "step",
+            "frequency": 1,
+        }
+        return {"optimizer": optimizer, "lr_scheduler": lr_scheduler}
 
 
-model_kwargs2 = {'inputChannel': 1, 'n_q':12, 'n_filters': 32,'n_residual_layers': 1, 'lstm': 0, 'ratios':[9,7,4,2] , 'final_activation': 'Sigmoid',
-            'residual_kernel_size': 6,'codebook_size':1024, 'FiLMEncoder' : False, 'FiLMDecoder' :False,'flattenQuantization' : False,
-            'quantizationdim': 256, 'biLSTM': False,'causal':False,'useQINCo':False,'inputSize' : 13500,'dimension':256,'kernel_size':8, 
-            'encoders':False,'bucketTransform':False,'applyquantizerdroput':True,'transformer':6}
-num_epochs = 50
-SpectraStream = modelStream.SpectroVQ(**model_kwargs2)
-compile_model(SpectraStream, args.compile, device)
-# %%
-learning_rate = 1e-4
-batch_size = 32
-torch.cuda.empty_cache()
-# %%
-print('Preprocessing Training Data')
-traindata,testdata = PreprocessData()
-# %%
-print('Creating Training Data Loaders')
-spectraTrainData = SpectrumBatch(traindata)
-# On Linux, fork lets the workers share the dataset instead of each unpickling a copy
-# (~20 GB, minutes per worker, every epoch). Elsewhere fork is unsafe: keep the default.
-loader_context = 'fork' if sys.platform.startswith('linux') else None
-train_loader = DataLoader(spectraTrainData, batch_size=batch_size, shuffle=True,num_workers=28,drop_last=True,pin_memory=True, prefetch_factor = 24, multiprocessing_context=loader_context)
-spectraTestData = SpectrumBatch(testdata)
-test_loader = DataLoader(spectraTestData, batch_size=batch_size, shuffle=False,num_workers=28,drop_last=True,pin_memory = True, prefetch_factor = 24, multiprocessing_context=loader_context)
-LightningTrainer = LightningModelSpectraStream(SpectraStream,learning_rate=learning_rate,len_train_loader = len(train_loader),len_test_loader = len(test_loader))
-checkpoint_callback = ModelCheckpoint(dirpath=output_dir,monitor = 'val_mean_loss',filename='SpectroVQ-{epoch:02d}-{val_loss:.2f}',save_top_k=3,mode='min') 
-early_stop_callback = EarlyStopping(monitor="val_mean_loss", min_delta=0.005, patience=4, verbose=True, mode="min",check_on_train_epoch_end = False)
-trainer = L.Trainer(max_epochs = num_epochs, log_every_n_steps = 1, check_val_every_n_epoch = 3, callbacks=[early_stop_callback,checkpoint_callback],accelerator="gpu", devices=1, num_nodes=1, strategy="auto",gradient_clip_val=1)
-trainer.fit(LightningTrainer,train_dataloaders = train_loader,val_dataloaders = test_loader)
+class ResumeState(Callback):
+    """Sampler position, stored in the checkpoint (what Lightning leaves out).
 
-# %%
+    Holds only ints, bools and strings: ApplyWeights reads checkpoints with the default
+    torch.load. Model RNG state is deliberately not saved: a resumed run is correct, not
+    bit-identical.
+    """
+
+    # Set in setup(), which Lightning calls before any checkpoint is saved.
+    trainer: L.Trainer
+    module: LightningModelSpectraStream
+
+    def __init__(self, sampler, val_dataset):
+        self.sampler, self.val_dataset = sampler, val_dataset
+        self.batches_done = 0  # finished this epoch
+        self._should_stop = False
+
+    def setup(self, trainer, pl_module, stage):
+        self.trainer, self.module = trainer, pl_module
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        self.batches_done += 1
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        self.batches_done = 0
+
+    def state_dict(self):
+        return {
+            # What Lightning passes to set_epoch, not current_epoch (which reads `completed`).
+            # A _ProcessedTracker at runtime; Lightning declares the narrower base type.
+            "epoch": self.trainer.fit_loop.epoch_progress.current.processed,  # ty: ignore[unresolved-attribute]
+            "batches_done": self.batches_done,
+            "val_epoch": self.val_dataset.epoch,
+            "should_stop": bool(self.trainer.should_stop),
+        }
+
+    def load_state_dict(self, state_dict):
+        # Before Lightning creates the data iterator (fit_loop.setup_data), which is built
+        # before its _set_sampler_epoch runs.
+        self.sampler.set_epoch(state_dict["epoch"])
+        self.sampler.skip_batches = self.batches_done = state_dict["batches_done"]
+        self.val_dataset.epoch = state_dict["val_epoch"]
+        self._should_stop = state_dict["should_stop"]
+
+    def on_train_start(self, trainer, pl_module):
+        # Lightning resets this on every fit, so an early stop just before a pause would be lost.
+        trainer.should_stop = self._should_stop
+
+
+class ResumeCheckpoint(ModelCheckpoint):
+    """Periodic resume checkpoint, also written on a graceful stop (SIGTERM)."""
+
+    def on_train_batch_end(self, trainer, *args, **kwargs):
+        if not trainer.is_last_batch:  # a save here may skip validation on resume
+            super().on_train_batch_end(trainer, *args, **kwargs)
+
+    def on_exception(self, trainer, pl_module, exception):
+        # During validation the loss average is in memory only: leave the last periodic save.
+        if isinstance(exception, SIGTERMException) and not trainer.validating:
+            super().on_exception(trainer, pl_module, exception)
+
+
+model_kwargs2: dict[str, Any] = {
+    "inputChannel": 1,
+    "n_q": 12,
+    "n_filters": 32,
+    "n_residual_layers": 1,
+    "lstm": 0,
+    "ratios": [9, 7, 4, 2],
+    "final_activation": "Sigmoid",
+    "residual_kernel_size": 6,
+    "codebook_size": 1024,
+    "FiLMEncoder": False,
+    "FiLMDecoder": False,
+    "flattenQuantization": False,
+    "quantizationdim": 256,
+    "biLSTM": False,
+    "causal": False,
+    "useQINCo": False,
+    "inputSize": SPECTRA_DIMENSION,
+    "dimension": 256,
+    "kernel_size": 8,
+    "encoders": False,
+    "bucketTransform": False,
+    "applyquantizerdroput": True,
+    "transformer": 6,
+}
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Training script for SpectroVQ")
+    parser.add_argument(
+        "--data_path",
+        type=str,
+        default=config.TRAIN_DATA_PATH,
+        help="data path to the consensus library file (.feather)",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=".",
+        help="output directory for the trained model",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=config.TRAIN_BATCH_SIZE,
+        help="batch size for training",
+    )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=config.NUM_WORKERS,
+        help="number of workers for data loading",
+    )
+
+    # Model hyperparameters
+    parser.add_argument(
+        "--learning_rate",
+        type=float,
+        default=config.LEARNING_RATE,
+        help="learning rate for training",
+    )
+    parser.add_argument(
+        "--max_epochs",
+        type=int,
+        default=config.MAX_EPOCHS,
+        help="maximum number of training epochs",
+    )
+
+    # Pause and resume
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="continue from <output_dir>/resume/resume.ckpt; --batch_size, --max_epochs, "
+        "--learning_rate and the library must match the first run (checked)",
+    )
+    parser.add_argument(
+        "--checkpoint_minutes",
+        type=float,
+        default=config.CHECKPOINT_MINUTES,
+        help="minutes between resume checkpoints",
+    )
+    parser.add_argument(
+        "--accelerator",
+        type=str,
+        default=config.DEFAULT_ACCELERATOR,
+        help="Lightning accelerator: auto, cpu, cuda, mps",
+    )
+    add_compile_argument(
+        parser,
+        "torch.compile the encoder and decoder (CUDA only; the quantizer stays eager). "
+        "Checkpoints and --resume still work, and a resume may compile differently.",
+    )
+    add_background_argument(parser)
+    return parser.parse_args(argv)
+
+
+def resume_settings(args):
+    """What has to stay the same across a pause: the sampler position, LR schedule and
+    optimizer state in the checkpoint only fit the run they came from. Worker count,
+    accelerator, compile mode and checkpoint interval may change."""
+    return {
+        "batch_size": args.batch_size,
+        "max_epochs": args.max_epochs,
+        "learning_rate": args.learning_rate,
+        "library": library_fingerprint(args.data_path),
+        # Through JSON, as the recorded copy is: tuples come back as lists.
+        "model": json.loads(json.dumps(model_kwargs2)),
+    }
+
+
+def main(argv=None, extra_callbacks=()):
+    args = parse_args(argv)
+    output_dir = args.output_dir
+    store = ResumeStore(output_dir)
+    # resume_settings fingerprints the library, so check it first for a clear message.
+    if not os.path.isfile(args.data_path):
+        sys.exit(f"Training library not found: {args.data_path}")
+    # Absolute: the session is read from other working directories.
+    # os.path.abspath, as _session_params and the GUI record it: Path.absolute() keeps "..",
+    # and the resume lookup compares the strings.
+    ckpt_dir = Path(os.path.abspath(output_dir))
+    # A resume continues the paused session, wherever it was started.
+    continues = {"output_dir": str(ckpt_dir)} if args.resume else None
+    settings = resume_settings(args)
+    # Checked against the session before it is opened, so a refused start shows in the
+    # terminal and leaves no failed session behind.
+    paused = existing_session("train", continues) if args.resume else None
+    try:
+        warnings = store.begin(
+            settings,
+            resume=args.resume,
+            recorded=read_job(paused).get(RESUME_SETTINGS) if paused else None,
+        )
+    except ResumeError as e:
+        sys.exit(str(e))
+    for w in warnings:
+        print(f"Warning: {w}", flush=True)
+    with run_session(
+        args,
+        __file__,
+        argv,
+        kind="train",
+        params=_session_params(args),
+        outputs=lambda: sorted(ckpt_dir.glob("*.ckpt"), key=os.path.getmtime),
+        continues=continues,
+        hint="Pause with: kill -TERM <PID>, then continue with --resume.",
+    ) as job:
+        # What the next --resume is checked against (on a resume, the same settings).
+        update_job(job, **{RESUME_SETTINGS: settings})
+        try:
+            _train(args, store, extra_callbacks)
+        finally:
+            store.unlock()
+
+
+def _session_params(args):
+    """The settings recorded for a --background run, named as the GUI's Train tab names
+    its own, so either can resume the other's run."""
+    return {
+        "input": os.path.abspath(args.data_path),
+        "batch_size": args.batch_size,
+        "learning_rate": args.learning_rate,
+        "max_epochs": args.max_epochs,
+        "num_workers": args.num_workers,
+        "checkpoint_minutes": args.checkpoint_minutes,
+        "output_dir": os.path.abspath(args.output_dir),
+    }
+
+
+def _train(args, store, extra_callbacks):
+    output_dir = args.output_dir
+    try:
+        store.lock()  # released by main() when training ends
+    except ResumeError as e:
+        sys.exit(str(e))
+    # Pause with: kill -TERM <pid>, to this process only, not its data loader workers.
+    print(f"Training process PID: {os.getpid()}", flush=True)
+
+    seed_everything(BASE_SEED, workers=True)
+    torch.set_float32_matmul_precision("high")
+
+    if CUDAAccelerator.is_available():
+        torch.backends.cudnn.benchmark = True
+
+    print("Starting Training Program")
+
+    num_epochs = args.max_epochs
+    SpectraStream = modelStream.SpectroVQ(**model_kwargs2)
+    if args.compile != "none":
+        compile_model(SpectraStream, args.compile, resolve_device(args.accelerator))
+    learning_rate = args.learning_rate
+    batch_size = args.batch_size
+    print("Preprocessing Training Data")
+    traindata, testdata = PreprocessData(args.data_path)
+    print("Creating Training Data Loaders")
+    spectraTrainData = SpectrumBatch(traindata)
+    train_sampler = ResumableSampler(spectraTrainData, batch_size)
+    # On Linux, fork lets the workers share the dataset instead of each unpickling a copy
+    # (~20 GB, minutes per worker, every epoch). Elsewhere fork is unsafe: keep the default.
+    loader_context = (
+        "fork" if sys.platform.startswith("linux") and args.num_workers > 0 else None
+    )
+    train_loader = DataLoader(
+        spectraTrainData,
+        batch_size=batch_size,
+        sampler=train_sampler,
+        num_workers=args.num_workers,
+        drop_last=True,
+        pin_memory=True,
+        prefetch_factor=24 if args.num_workers > 0 else None,
+        multiprocessing_context=loader_context,
+    )
+    spectraTestData = SpectrumBatch(testdata)
+    test_loader = DataLoader(
+        spectraTestData,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        drop_last=True,
+        pin_memory=True,
+        prefetch_factor=24 if args.num_workers > 0 else None,
+        multiprocessing_context=loader_context,
+    )
+    LightningTrainer = LightningModelSpectraStream(
+        SpectraStream,
+        learning_rate=learning_rate,
+        len_train_loader=len(train_loader),
+        len_test_loader=len(test_loader),
+        max_epochs=num_epochs,
+    )
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=output_dir,
+        monitor="val_mean_loss",
+        filename="SpectroVQ-{epoch:02d}-{val_loss:.2f}",
+        save_top_k=3,
+        mode="min",
+    )
+    early_stop_callback = EarlyStopping(
+        monitor="val_mean_loss",
+        min_delta=0.005,
+        patience=4,
+        verbose=True,
+        mode="min",
+        check_on_train_epoch_end=False,
+    )
+    resume_callback = ResumeCheckpoint(
+        dirpath=store.dir,
+        filename=store.checkpoint.stem,
+        monitor=None,
+        save_top_k=1,
+        enable_version_counter=False,  # always overwrite one file
+        train_time_interval=timedelta(minutes=args.checkpoint_minutes),
+        save_on_exception=True,
+    )
+    trainer = L.Trainer(
+        max_epochs=num_epochs,
+        log_every_n_steps=1,
+        check_val_every_n_epoch=3,
+        callbacks=[
+            ResumeState(train_sampler, spectraTestData),
+            early_stop_callback,
+            checkpoint_callback,
+            resume_callback,
+            *extra_callbacks,
+        ],
+        accelerator=args.accelerator,
+        devices=1,
+        num_nodes=1,
+        strategy="auto",
+        gradient_clip_val=1,
+    )
+    try:
+        trainer.fit(
+            LightningTrainer,
+            train_dataloaders=train_loader,
+            val_dataloaders=test_loader,
+            ckpt_path=store.checkpoint if args.resume else None,
+        )
+    except SIGTERMException:
+        # Otherwise it exits 0 and looks finished.
+        print(
+            "Paused. Continue with --resume, using the same settings."
+            if store.find()
+            else "Paused before any resume checkpoint was written: nothing to continue from.",
+            flush=True,
+        )
+        sys.exit(EXIT_PAUSED)
+    store.discard()  # finished
+
+
+if __name__ == "__main__":
+    main()

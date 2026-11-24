@@ -42,15 +42,16 @@ def massSpectrumToVector(mz_list,intensity_list,bin_size = 0.1,SPECTRA_DIMENSION
         mz_list = mz_list[idx]
         intensity_list = intensity_list[idx]
 
-    Maxval = np.max(intensity_list)
-    intensity_list = (intensity_list - Minval)/(Maxval - Minval)    
-
+    # Before np.max: a spectrum can have peaks but none inside mzRange
     if len(mz_list) == 0:
         if returntorch:
             return torch.zeros(SPECTRA_DIMENSION,device = device),0
         else:
-            return np.zeros(SPECTRA_DIMENSION),0
-    
+            return np.zeros(SPECTRA_DIMENSION), 0
+
+    Maxval = np.max(intensity_list)
+    intensity_list = (intensity_list - Minval) / (Maxval - Minval)
+
     if GenerateMZList:
         OriginalMZ = mz_list
         if returntorch:

@@ -86,9 +86,13 @@ class SpectroVQ(nn.Module):
         
         self.quantizationdim = quantizationdim
         self.n_q = n_q
-        flattenShape = self.encoder(torch.randn(1,inputChannel,inputSize)).size(1), self.encoder(torch.randn(1,inputChannel,inputSize)).size(2)
-        print('flattenShape:',flattenShape)
-        quantizedchannel, quantizedlen = flattenShape[0] , flattenShape[1]
+        self.codebook_size = codebook_size
+        flattenShape = (
+            self.encoder(torch.randn(1, inputChannel, inputSize)).size(1),
+            self.encoder(torch.randn(1, inputChannel, inputSize)).size(2),
+        )
+        print("flattenShape:", flattenShape)
+        quantizedchannel, quantizedlen = flattenShape[0], flattenShape[1]
         flattenShape = flattenShape[0] * flattenShape[1]
         self.quantizedlen = quantizedlen
         self.quantizedchannel = quantizedchannel
@@ -120,7 +124,9 @@ class SpectroVQ(nn.Module):
             self.quantization = qt.ResidualVectorQuantization(num_quantizers=n_q, codebook_size=codebook_size,dim = self.quantizationdim, kmeans_init=kmeans_init,
                 kmeans_iters=kmeans_iters,threshold_ema_dead_code=threshold_ema_dead_code,l2norm = quantl2)
             if useQINCo:
-                self.quantization = QINCo(d = self.quantizationdim, K = codebook_size, L = 1, M = n_q, h = 64)
+                raise NotImplementedError(
+                    "useQINCo=True is not supported: no QINCo quantizer is implemented"
+                )
         else:
             self.quantization = nn.Identity()
         
@@ -181,12 +187,12 @@ class SpectroVQ(nn.Module):
             else:
                 quantized = x
                 BeforeQuantization = None
-                out_losses = torch.tensor(0.0)
+                out_losses = x.new_zeros(())
         else:
             quantized = x
             BeforeQuantization = None
-            out_losses = torch.tensor(0.0)
-        x = self.decoder(quantized,FiLM_input)
+            out_losses = x.new_zeros(())
+        x = self.decoder(quantized, FiLM_input)
         if x.shape[2] != input.shape[2]:
             x = x[:,:,:input.shape[2]]
         if returnAll:

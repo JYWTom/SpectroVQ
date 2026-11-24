@@ -1,26 +1,64 @@
 from utils.Compression import batchprocessor
-from utils.Compression import compress
+from utils.Compression import compress, header
 from utils.Compression import postprocessing
-from pyteomics import mgf
+from utils.config import CODEC_BATCH_SIZE
+from utils.formats import RunMetadata, Spectrum, get_writer
+from utils.formats.mzml import MzMLWriter
+from utils.formats.mzml_metadata import (
+    COLUMN_PREFIX,
+    COLUMNS_KEY,
+    HEADER_KEY,
+    decode_row,
+    load_definitions,
+)
+import hashlib
+import math
 import os
 import torch
 import numpy as np
 import pandas as pd
-import pickle
-import traceback
+import pyarrow.parquet as pq
 from typing import OrderedDict
 
-DEFAULTMGFPARAMSKEYS = ['title','rtinseconds','pepmass','charge','scans','seq','modifications']
-class MGFDecompressor():
-    def __init__(self,model,inputFileName,outputfilemgf = None, batch_size = None,quantizer = 6, stored_raw = False,
-                 gzip_compression_level = None,zlib_compression_level = 6, zstd_compression_level = None):
+DEFAULTMGFPARAMSKEYS = [
+    "title",
+    "rtinseconds",
+    "pepmass",
+    "charge",
+    "scans",
+    "seq",
+    "modifications",
+]
+
+
+def _missing(value):
+    return (
+        value is None
+        or value is pd.NA
+        or (isinstance(value, float) and math.isnan(value))
+    )
+
+
+class SpectrumDecompressor:
+    def __init__(
+        self,
+        model,
+        inputFileName,
+        outputFilePath=None,
+        batch_size=None,
+        quantizer=6,
+        stored_raw=False,
+        gzip_compression_level=None,
+        zlib_compression_level=6,
+        zstd_compression_level=None,
+    ):
         """
-        Initialize the MGFDecompressor for decompressing mass spectrometry data.
+        Initialize the SpectrumDecompressor for decompressing mass spectrometry data.
 
         Args:
             model: Neural network model for decoding spectra
             inputFileName (str): Path to the compressed input file (.vqms2 format)
-            outputfilemgf (str, optional): Path for output MGF file. Defaults to 'output.mgf'.
+            outputFilePath (str, optional): Path for output file; format chosen by extension. Defaults to 'output.mgf'.
             batch_size (int, optional): Number of spectra to process in each batch. Defaults to 128.
             quantizer (int): Number of quantization levels used during compression. Defaults to 6.
             stored_raw (bool): Whether to store raw reconstructed spectra in addition to compounded spectra. When False, only compounded spectra are stored if available.
@@ -28,36 +66,73 @@ class MGFDecompressor():
             zlib_compression_level (int): Compression level for zlib. Defaults to 6.
         """
         self.model = model
-        if outputfilemgf is None:
+        if outputFilePath is None:
             folder_path = os.path.dirname(inputFileName)
-            self.OutputFileMGF = os.path.join(folder_path, 'output.mgf')
+            self.OutputFilePath = os.path.join(folder_path, "output.mgf")
         else:
-            self.OutputFileMGF = outputfilemgf
-            assert self.OutputFileMGF.endswith('.mgf'), 'Output file must be in MGF format'
+            self.OutputFilePath = outputFilePath
+        self.writer = get_writer(self.OutputFilePath)  # validates the extension
         self.inputFileName = inputFileName
         self.device = next(self.model.parameters()).device
-        assert os.path.exists(self.inputFileName), 'Input file does not exist'
-        self.inputFileNameWithoutExt = '.'.join(inputFileName.split('.')[:-1])
-        self.depacker = compress.BitUnpacker(10, open(self.inputFileName, 'rb'),gzip_compression=gzip_compression_level, zlib_compression=zlib_compression_level, zstd_compression = zstd_compression_level)
-        self.metadataFileName = self.inputFileNameWithoutExt + '.parquet' 
+        assert os.path.exists(self.inputFileName), "Input file does not exist"
+        self.inputFileNameWithoutExt = ".".join(inputFileName.split(".")[:-1])
+        self.metadataFileName = self.inputFileNameWithoutExt + ".parquet"
+        # Check the recorded settings before reading any codes
+        header.check_codebook(model)
+        header.check_quantizer(model, quantizer)
+        header.check(
+            self.metadataFileName,
+            quantizer,
+            header.codec_name(
+                gzip_compression_level, zlib_compression_level, zstd_compression_level
+            ),
+            self.model.quantizedlen,
+        )
+        footer = pq.read_schema(self.metadataFileName).metadata or {}
+        self.mzmlHeader = footer.get(HEADER_KEY)
+        self.mzmlDefinitions = (
+            load_definitions(footer[COLUMNS_KEY]) if COLUMNS_KEY in footer else []
+        )
+        if isinstance(self.writer, MzMLWriter):
+            if self.mzmlHeader is None:
+                raise ValueError(
+                    "This archive has no mzML metadata (it was not compressed from "
+                    "an mzML file), so it can only be decompressed to MGF"
+                )
+            if stored_raw:
+                raise ValueError(
+                    "stored_raw is not supported for mzML output: raw copies would "
+                    "duplicate spectrum ids, which mzML requires to be unique"
+                )
+        self.depacker = compress.BitUnpacker(
+            10,
+            open(self.inputFileName, "rb"),
+            gzip_compression=gzip_compression_level,
+            zlib_compression=zlib_compression_level,
+            zstd_compression=zstd_compression_level,
+        )
         self.MaxValList = []
-        if batch_size is None:
-            Warning('Batch size is not defined; using default batch size of 128')
-            self.batch_size = 128
-        else:
-            self.batch_size = batch_size
+        self.batch_size = CODEC_BATCH_SIZE if batch_size is None else batch_size
         self.quantizer = quantizer
         self.stored_raw = stored_raw
         # Always process compounded spectra if available for reconstruction
         self.process_compounded = True
         self.compounded_codes_list = []
-        if os.path.exists(self.inputFileNameWithoutExt + '_compounded.pkl'):
-            with open(self.inputFileNameWithoutExt + '_compounded.pkl','rb') as f:
-                self.compounded_idx_list = pickle.load(f)
-        else:
-            Warning('Compounded file not found, compounded spectra will not be processed')
-                
+        self.compounded_idx_list = header.read_compounded(
+            footer, self.inputFileNameWithoutExt
+        )
+
         self.compounded_original_codes_dict = {}
+
+    def _pull(self):
+        value = self.depacker.pull()
+        if value is None:
+            raise ValueError(
+                f"{self.inputFileName} ended before all codes were read: the file is "
+                "truncated, or --quantizer / the compression method differ from "
+                "the ones used to compress it"
+            )
+        return value
 
     @staticmethod
     def changeSpectrumName(name):
@@ -80,22 +155,54 @@ class MGFDecompressor():
         Format spectrum for MGF output.
         
         """
-        spectrum = {'m/z array': postprocessing.changeTofloat(list(output_mz)), 
-                               'intensity array': np.array(list(output_intensity), np.float64)}
-        spectrum.update({'params': {key: metaDataBatchrow[key]
-                                              for key in metaDataBatchrow.index}})
+        # A key only some spectra have comes back from parquet as None or NaN for the
+        # others: leave it out rather than writing RTINSECONDS=nan, CHARGE=nan, ...
+        params = {
+            key: metaDataBatchrow[key]
+            for key in metaDataBatchrow.index
+            if not key.startswith(COLUMN_PREFIX) and not _missing(metaDataBatchrow[key])
+        }
         if modify_flag:
-            spectrum['params'].update({'title': self.changeSpectrumName(metaDataBatchrow['title'])})
+            params["title"] = self.changeSpectrumName(metaDataBatchrow["title"])
         else:
-            spectrum['params'].update({'title': metaDataBatchrow['title']})
-        spectrum['params'].update({'pepmass': (spectrum['params']['pepmz'], 
-                                                          spectrum['params']['pepit'])})
-        spectrum['params'].pop('pepmz')
-        spectrum['params'].pop('pepit')
-        return spectrum
-    
+            params["title"] = metaDataBatchrow["title"]
+        pepmz, pepit = params.pop("pepmz", None), params.pop("pepit", None)
+        if pepmz is not None:
+            params["pepmass"] = (pepmz, pepit)
+        if "charge" in params:
+            params["charge"] = int(params["charge"])  # float when some were null
+        return Spectrum(
+            mz=postprocessing.changeTofloat(list(output_mz)),
+            intensity=np.array(list(output_intensity), np.float64),
+            params=params,
+            mzml=(
+                decode_row(metaDataBatchrow, self.mzmlDefinitions)
+                if isinstance(self.writer, MzMLWriter)
+                else {}
+            ),
+        )
+
+    def runMetadata(self):
+        """File-level metadata for the writer, or None if the archive has none."""
+        if self.mzmlHeader is None:
+            return None
+        weights = hashlib.sha256()
+        for name, tensor in sorted(self.model.state_dict().items()):
+            weights.update(name.encode())
+            weights.update(tensor.detach().cpu().numpy().tobytes())
+        return RunMetadata(
+            self.mzmlHeader.decode(),
+            {"model sha256": weights.hexdigest(), "quantizers": str(self.quantizer)},
+        )
+
     # Mode 1: Load All Spectra, then perform decompression
     def DecompressAll(self, verbose=0):
+        try:
+            self._decompress_all(verbose)
+        finally:
+            self.depacker.close()  # also on a truncated or corrupt input
+
+    def _decompress_all(self, verbose):
         """
         Decompress all spectra from compressed format to MGF.
 
@@ -124,13 +231,8 @@ class MGFDecompressor():
                 print(f'Extracted codes for {j} spectra...')
             for k in range(self.quantizer):
                 for l in range(self.model.quantizedlen):
-                    try:
-                        all_output_codes[j, k, l] = self.depacker.pull()
-                    except:
-                        traceback.print_exc()
-                        print(f'Error extracting code for spectrum {j}, quantizer {k}, position {l}')
-                        raise
-        
+                    all_output_codes[j, k, l] = self._pull()
+
         # Process all codes in batches
         if verbose >= 1:
             print(f'Starting to process {total_spectra} spectra in batches of {self.batch_size}...')
@@ -148,13 +250,15 @@ class MGFDecompressor():
             for j in range(compounded_indices.shape[0]):
                 for k in range(self.quantizer):
                     for l in range(self.model.quantizedlen):
-                        compounded_codes[j, k, l] = self.depacker.pull()
-            
-            compounded_max_value_list = df_metadata['MaxVal'].values[compounded_indices]
-            df_metadata['OriginalIndex'] = range(len(df_metadata))
-            compounded_metadata_df = df_metadata.copy().iloc[compounded_indices].reset_index(drop = True)
-            
-            original_codes = all_output_codes[compounded_indices,:]
+                        compounded_codes[j, k, l] = self._pull()
+
+            compounded_max_value_list = df_metadata["MaxVal"].values[compounded_indices]
+            df_metadata["OriginalIndex"] = range(len(df_metadata))
+            compounded_metadata_df = (
+                df_metadata.copy().iloc[compounded_indices].reset_index(drop=True)
+            )
+
+            original_codes = all_output_codes[compounded_indices, :]
 
             if verbose >= 1:
                 print(f"A total of {compounded_codes.shape[0]} spectra contains compounded data, processing them now...")
@@ -198,9 +302,17 @@ class MGFDecompressor():
 
                 # Convert compounded spectra to MGF format
                 for k in range(len(batched_compounded_max_value_list)):
-                    spectrum = self.formatMGFformat(output_mz[k], output_intensity[k], batched_compounded_metadata.iloc[k])
-                    CompoundedSpectrumDict[str(batched_compounded_metadata.iloc[k]['OriginalIndex'])] = spectrum
-                    CompoundedSpectrumDict[str(batched_compounded_metadata.iloc[k]['OriginalIndex'])]['params'].pop('OriginalIndex')
+                    spectrum = self.formatMGFformat(
+                        output_mz[k],
+                        output_intensity[k],
+                        batched_compounded_metadata.iloc[k],
+                    )
+                    CompoundedSpectrumDict[
+                        str(batched_compounded_metadata.iloc[k]["OriginalIndex"])
+                    ] = spectrum
+                    CompoundedSpectrumDict[
+                        str(batched_compounded_metadata.iloc[k]["OriginalIndex"])
+                    ].params.pop("OriginalIndex")
         # Process other spectrum normally
         for batch_start in range(0, total_spectra, self.batch_size):
             batch_end = min(batch_start + self.batch_size, total_spectra)
@@ -230,11 +342,12 @@ class MGFDecompressor():
             output_mz, output_intensity = bp.getReconstructSpectrum()
             
             # Prepare batch metadata
-            metaDataBatch.pop('MaxVal')
-            if 'ExtendedMZ' in metaDataBatch.columns:
-                metaDataBatch.pop('ExtendedMZ')
-                metaDataBatch.pop('ExtendedIT')
-            metaDataBatch.pop('OriginalIndex')
+            metaDataBatch.pop("MaxVal")
+            if "ExtendedMZ" in metaDataBatch.columns:
+                metaDataBatch.pop("ExtendedMZ")
+                metaDataBatch.pop("ExtendedIT")
+            # Only present when some spectra were compounded
+            metaDataBatch = metaDataBatch.drop(columns="OriginalIndex", errors="ignore")
 
             # Convert batch to MGF format
             for k in range(current_batch_size):
@@ -244,7 +357,15 @@ class MGFDecompressor():
                 if str(batch_start + k) in CompoundedSpectrumDict.keys():
                     if verbose >= 2:
                         print(f"Spectrum {batch_start + k} is compounded")
-                    ListOfSpectrum.append(CompoundedSpectrumDict[str(batch_start + k)].copy())
+                    compounded = CompoundedSpectrumDict[str(batch_start + k)]
+                    ListOfSpectrum.append(
+                        Spectrum(
+                            compounded.mz,
+                            compounded.intensity,
+                            dict(compounded.params),
+                            compounded.mzml,
+                        )
+                    )
                     if self.stored_raw:
                         spectrum = self.formatMGFformat(output_mz[k], output_intensity[k], metaDataBatch.iloc[k], modify_flag=True)
                         ListOfRawSpectrum.append(spectrum)
@@ -253,9 +374,9 @@ class MGFDecompressor():
                     # Round m/z values to 2 decimal places
                     spectrum = self.formatMGFformat(output_mz[k], output_intensity[k], metaDataBatch.iloc[k], modify_flag=False)
                     ListOfSpectrum.append(spectrum)
-        
-        if verbose >=1:
-            print('Starting to write spectra to MGF file.')
+
+        if verbose >= 1:
+            print("Starting to write spectra to output file.")
             print(f"Number of spectra: {len(ListOfSpectrum)}")
         # if verbose >=2:
             # for spec in ListOfSpectrum:
@@ -265,9 +386,16 @@ class MGFDecompressor():
             TotalListSpectrum = ListOfSpectrum + ListOfRawSpectrum
             if verbose >= 1:
                 print(f"Number of raw spectra: {len(TotalListSpectrum)}")
-            mgf.write(TotalListSpectrum, self.OutputFileMGF)
+            self.writer.write(TotalListSpectrum, self.runMetadata())
         else:
-            mgf.write(ListOfSpectrum, self.OutputFileMGF)
-        
-        print(f'Decompression completed. Output written to {self.OutputFileMGF}')
+            self.writer.write(ListOfSpectrum, self.runMetadata())
 
+        print(f"Decompression completed. Output written to {self.OutputFilePath}")
+
+
+class MGFDecompressor(SpectrumDecompressor):
+    """Backwards-compatible entry point (``outputfilemgf`` keyword)."""
+
+    def __init__(self, model, inputFileName, outputfilemgf=None, *args, **kwargs):
+        super().__init__(model, inputFileName, outputfilemgf, *args, **kwargs)
+        self.OutputFileMGF = self.OutputFilePath

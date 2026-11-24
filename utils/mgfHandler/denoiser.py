@@ -1,12 +1,16 @@
 from torch.utils.data import Dataset
 from tqdm import tqdm
 import os
+from ..config import BIN_SIZE, MZ_RANGE, SPECTRA_DIMENSION
 from ..SpectrumProcessing import SpectraLoading
 import torch
 
 import numpy as np
 from ..model.modelStream import SpectroVQ
 import pandas as pd
+
+from ..formats import Spectrum, get_writer
+
 eps = 1e-6
 
 class SpectrumBatch(Dataset):
@@ -22,9 +26,21 @@ class SpectrumBatch(Dataset):
         return SpectraLoading.massSpectrumToVector(self.Xmz.iloc[idx],self.Xintensity.iloc[idx])
 
     def __getitem__(self, idx):
-        MSspectra,MaxVal = SpectraLoading.massSpectrumToVector(self.Xmz.iloc[idx],self.Xintensity.iloc[idx], bin_size = 0.1,SPECTRA_DIMENSION=13500,rawIT = False,Mode = None,mean0 = False,CenterIntegerBins=False,AlterMZ=False
-                                        ,GenerateMZList=False,MZDiff = False,mzRange = [150,1500])
-        return torch.sqrt(torch.unsqueeze(MSspectra,dim = 0)),MaxVal
+        MSspectra, MaxVal = SpectraLoading.massSpectrumToVector(
+            self.Xmz.iloc[idx],
+            self.Xintensity.iloc[idx],
+            bin_size=BIN_SIZE,
+            SPECTRA_DIMENSION=SPECTRA_DIMENSION,
+            rawIT=False,
+            Mode=None,
+            mean0=False,
+            CenterIntegerBins=False,
+            AlterMZ=False,
+            GenerateMZList=False,
+            MZDiff=False,
+            mzRange=[150, 1500],
+        )
+        return torch.sqrt(torch.unsqueeze(MSspectra, dim=0)), MaxVal
 
 
 class MGFDenoiser():
@@ -34,7 +50,7 @@ class MGFDenoiser():
     def __init__(self,model:SpectroVQ,inputMGF,outputMGF):
         self.inputMGF = inputMGF
         if not os.path.exists(self.inputMGF):
-            Warning(f'Input file {self.inputMGF} does not exist')
+            raise FileNotFoundError(f"Input file {self.inputMGF} does not exist")
         self.outputMGF = outputMGF
         self.model = model
         self.device = next(self.model.parameters()).device
@@ -42,35 +58,31 @@ class MGFDenoiser():
     def denoiseMGF(self,numQuantSingle = 3,retainOriginalPeaks = True,OnePercentThreshold = True,compoundedSpectra = True, num_workers = 0):
         file = self.inputMGF
         from pyteomics import mgf
-        reader = mgf.read(file)
-        filename = os.path.splitext(os.path.basename(file))[0]
-        ListofDicts = []
-        for u in reader:
-            ListofDicts.append(u)
-        df_train = pd.DataFrame.from_dict(ListofDicts)
-        
-        df_train['length'] = df_train['m/z array'].apply(len)
-        df_train['title'] = df_train['params'].apply(lambda x: x['title'] if 'title' in x else 'Unknown')
-        print('Processing:',file)
-        
+
+        with mgf.read(file) as reader:
+            ListofDicts = list(reader)
+        df_train = pd.DataFrame(ListofDicts)
+
+        df_train["length"] = df_train["m/z array"].apply(len)
+        df_train["title"] = df_train["params"].apply(
+            lambda x: x["title"] if "title" in x else "Unknown"
+        )
+        print("Processing:", file)
+
         spectraTrainData = SpectrumBatch(df_train)
         from torch.utils.data import DataLoader
         # Create a batch loader for the training data
         batch_size = 32
         train_loader = DataLoader(spectraTrainData, batch_size=batch_size, shuffle=False,num_workers=num_workers,drop_last=False,prefetch_factor = 5 if num_workers > 0 else None)
         with torch.no_grad():
-            from tqdm import tqdm
-            from matplotlib import pyplot as plt
-            import importlib
-            importlib.reload(SpectraLoading)
-            def rescaleSepectra(Spectra,dim):
-                SpectraMax = torch.max(Spectra,dim = dim,keepdim=True)[0]
-                SpectraMin = torch.min(Spectra,dim = dim,keepdim=True)[0]
-                return (Spectra - SpectraMin)/(SpectraMax - SpectraMin + 1e-6)
+
+            def rescaleSepectra(Spectra, dim):
+                SpectraMax = torch.max(Spectra, dim=dim, keepdim=True)[0]
+                SpectraMin = torch.min(Spectra, dim=dim, keepdim=True)[0]
+                return (Spectra - SpectraMin) / (SpectraMax - SpectraMin + 1e-6)
 
             rawIntensity = False
             addOriginalPeaks = retainOriginalPeaks
-            compoundedSpectra = True
             output_intensityList, output_mzList = [], []
             savedChimericSpectra = []
             savedChimericIdx = []
@@ -115,10 +127,30 @@ class MGFDenoiser():
                     for j in range(input_spectra.shape[0]):
                 
                         if rawIntensity:
-                            output_mz,output_intensity = SpectraLoading.VectorToMassSpectrum(output_spectra[j,:],1,bin_size = 0.1,threshold = 1e-4,min_mz = 150,AlterMZ=False,returnNumpy=True)
+                            output_mz, output_intensity = (
+                                SpectraLoading.VectorToMassSpectrum(
+                                    output_spectra[j, :],
+                                    1,
+                                    bin_size=BIN_SIZE,
+                                    threshold=1e-4,
+                                    min_mz=MZ_RANGE[0],
+                                    AlterMZ=False,
+                                    returnNumpy=True,
+                                )
+                            )
                             output_intensity = list(output_intensity)
                         else:
-                            output_mz,output_intensity = SpectraLoading.VectorToMassSpectrum(output_spectra[j,:],MaxVal[j],bin_size = 0.1,threshold = 1e-4,min_mz = 150,AlterMZ=False,returnNumpy=True)
+                            output_mz, output_intensity = (
+                                SpectraLoading.VectorToMassSpectrum(
+                                    output_spectra[j, :],
+                                    MaxVal[j],
+                                    bin_size=BIN_SIZE,
+                                    threshold=1e-4,
+                                    min_mz=MZ_RANGE[0],
+                                    AlterMZ=False,
+                                    returnNumpy=True,
+                                )
+                            )
                             output_intensity = list(output_intensity)
                         output_mz = list(np.round(output_mz+ 0.055 ,6))
                         if addOriginalPeaks:
@@ -131,10 +163,12 @@ class MGFDenoiser():
                             output_mz.extend(original_mz[missingidx])
                             output_intensity.extend(original_intensity[missingidx])
                         sortedidx = np.argsort(output_mz)
-                        output_mz = np.array(output_mz,np.float32)[sortedidx]
-                        output_intensity = np.array(output_intensity,np.float32)[sortedidx]
-                        if output_intensity.shape[0]  == 0:
-                            print(f'Empty at {j+i*128}')
+                        output_mz = np.array(output_mz, np.float32)[sortedidx]
+                        output_intensity = np.array(output_intensity, np.float32)[
+                            sortedidx
+                        ]
+                        if output_intensity.shape[0] == 0:
+                            print(f"Empty at {j + i * batch_size}")
                             output_mzList.append(output_mz)
                             output_intensityList.append(output_intensity)
                             continue
@@ -157,7 +191,17 @@ class MGFDenoiser():
                         RowList = []
                         
                         for i in range(chunk_start, chunk_end):
-                            output_mz,output_intensity = SpectraLoading.VectorToMassSpectrum(savedChimericSpectra[i],maxValList[i],bin_size = 0.1,threshold = 1e-4,min_mz = 150,AlterMZ=False,returnNumpy=True)
+                            output_mz, output_intensity = (
+                                SpectraLoading.VectorToMassSpectrum(
+                                    savedChimericSpectra[i],
+                                    maxValList[i],
+                                    bin_size=BIN_SIZE,
+                                    threshold=1e-4,
+                                    min_mz=MZ_RANGE[0],
+                                    AlterMZ=False,
+                                    returnNumpy=True,
+                                )
+                            )
                             output_intensity = list(output_intensity)
                             output_mz = list(np.round(output_mz+ 0.055 ,6))
                             sortedidx = np.argsort(output_mz)
@@ -173,12 +217,15 @@ class MGFDenoiser():
                                 output_intensity = output_intensity[thresholdix]
                             
                             Newrow = df_train.iloc[savedChimericIdx[i]].copy()
-                            Newrow['m/zNew'] = output_mz
-                            Newrow['intensityNew'] = output_intensity
-                            NewDict = Newrow['params'].copy()
-                            NewDict['title'] = Newrow['params']['title'] + '_raw_' + str(i)
-                            NewDict['rtinseconds'] += 0.03
-                            Newrow['params'] = NewDict
+                            Newrow["m/zNew"] = output_mz
+                            Newrow["intensityNew"] = output_intensity
+                            NewDict = Newrow["params"].copy()
+                            NewDict["title"] = (
+                                Newrow["params"]["title"] + "_raw_" + str(i)
+                            )
+                            if "rtinseconds" in NewDict:
+                                NewDict["rtinseconds"] += 0.03
+                            Newrow["params"] = NewDict
                             if len(output_mz) < 2:
                                 print(f'Empty at compoundedSpectra {i}')
                                 continue
@@ -199,25 +246,13 @@ class MGFDenoiser():
                 mzColumnName = 'm/zNew'
                 intensityColumnName = 'intensityNew'
 
-                from pyteomics import mgf
-                def changeTofloat(arr):
-                    return np.round(np.array(arr,np.float64),4)
-                
-                def writeMGF(df,mzColumnName,intensityColumnName,OutputPath):
-                    if file.endswith('.mgf'):
-                        Seq_mzs = df.apply(lambda x: {'m/z array':changeTofloat(list(x[mzColumnName])),'intensity array':np.array(list(x[intensityColumnName]),np.float64),'params':x['params']},axis = 1)#,'Charge':x['charge array'],'params':{'Title':x['title'],'File':x['filetitle'],'NativeID':x['ID'],'PEPMASS':str(x['PrecursorMasses']) + ' ' + str(x['PrecursorIT']),'RTINSECONDS':x['RT']*60,'Charge':str(x['Charge'])+'+','CollisionEnergy':x['CollisionEnergy']}},axis = 1)
-                    elif file.endswith('.mzXML'):
-                        Seq_mzs = df.apply(lambda x: {'m/z array':changeTofloat(list(x[mzColumnName])),'intensity array':np.array(list(x[intensityColumnName]),np.float64),'params':{'Title':str(filename) + '_'+x['id'],'File':str(filename),'NativeID':x['id'],'PEPMASS':str(x['PrecursorMZValue']) + ' ' + str(x['precursorMz'][0]['precursorIntensity']),'RTINSECONDS':x['retentionTime'],'Charge':str(x['charge'])+'+','CollisionEnergy':x['collisionEnergy']}},axis = 1)
-
-                    def getSpectra(Seq_mzs):
-                        for i, row in Seq_mzs.items():
-                            yield {
-                                'm/z array': row['m/z array'],
-                                'intensity array': row['intensity array'],
-                                'params': row['params']
-                            }
-                    mgf.write(getSpectra(Seq_mzs),OutputPath)
-
-                writeMGF(df_train,mzColumnName,intensityColumnName,self.outputMGF)
-                print(f'Wrote to {self.outputMGF}')
-                print('Done!')
+                get_writer(self.outputMGF).write(
+                    Spectrum(
+                        np.round(np.asarray(row[mzColumnName], np.float64), 4),
+                        np.asarray(row[intensityColumnName], np.float64),
+                        row["params"],
+                    )
+                    for _, row in df_train.iterrows()
+                )
+                print(f"Wrote to {self.outputMGF}")
+                print("Done!")

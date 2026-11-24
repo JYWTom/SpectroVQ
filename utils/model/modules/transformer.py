@@ -1,10 +1,7 @@
-from torch import nn
-import typing as tp
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # This software may be used and distributed according to the terms of the Llama 2 Community License Agreement.
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -16,10 +13,10 @@ class ModelArgs:
     dim: int = 2048
     n_layers: int = 3
     n_heads: int = 8
-    n_kv_heads: Optional[int] = None
+    n_kv_heads: int | None = None
     # vocab_size: int = -1  # defined later by tokenizer
     multiple_of: int = 256  # make SwiGLU hidden layer size multiple of large power of 2
-    ffn_dim_multiplier: Optional[float] = None
+    ffn_dim_multiplier: float | None = None
     norm_eps: float = 1e-5
 
     #max_batch_size: int = 32
@@ -93,8 +90,8 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
 
     """
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device)  # type: ignore
-    freqs = torch.outer(t, freqs).float()  # type: ignore
+    t = torch.arange(end, device=freqs.device)
+    freqs = torch.outer(t, freqs).float()
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
     return freqs_cis
 
@@ -103,7 +100,7 @@ def apply_rotary_emb(
     xq: torch.Tensor,
     xk: torch.Tensor,
     freqs_cis: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Apply rotary embeddings to query 'xq' and key 'xk' with real arithmetic.
 
@@ -217,7 +214,7 @@ class Attention(nn.Module):
         x: torch.Tensor,
         #start_pos: int,
         freqs_cis: torch.Tensor,
-        mask: Optional[torch.Tensor],
+        mask: torch.Tensor | None,
     ):
         """
         Forward pass of the attention module.
@@ -273,7 +270,7 @@ class FeedForward(nn.Module):
         dim: int,
         hidden_dim: int,
         multiple_of: int,
-        ffn_dim_multiplier: Optional[float],
+        ffn_dim_multiplier: float | None,
     ):
         """
         Initialize the FeedForward module.
@@ -344,7 +341,7 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         #start_pos: int,
         freqs_cis: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
+        mask: torch.Tensor | None = None,
     ):
         """
         Perform a forward pass through the TransformerBlock.
@@ -366,6 +363,8 @@ class TransformerBlock(nn.Module):
         return out
 
 class Transformer(nn.Module):
+    freqs_cis: torch.Tensor  # non-persistent buffer
+
     def __init__(self, params: ModelArgs):
         """
         Initialize a Transformer model.
@@ -402,15 +401,14 @@ class Transformer(nn.Module):
         #     params.dim, params.vocab_size, bias=False, init_method=lambda x: x
         # )
 
-        # A non-persistent buffer: it follows the model's device without a reassignment in
-        # forward (which torch.compile can't trace) and stays out of the state_dict.
         self.register_buffer(
             "freqs_cis",
             torch.view_as_real(
                 # Note that self.params.max_seq_len is multiplied by 2 because the token limit for the Llama 2 generation of models is 4096. 
                 # Adding this multiplier instead of using 4096 directly allows for dynamism of token lengths while training or fine-tuning.
                 precompute_freqs_cis(
-                    self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
+                    self.params.dim // self.params.n_heads,
+                    self.params.max_seq_len * 2,
                 )
             ).contiguous(),  # real (end, dim // 2, 2): cos and sin
             persistent=False,
@@ -429,9 +427,9 @@ class Transformer(nn.Module):
             torch.Tensor: Output logits after applying the Transformer model.
 
         """
-        #Convolution Output (B,Dim,Len) -> Transformer input (B,Dim,Len)
-        tokens = tokens.permute(0,2,1)
-        _bsz,seqlen,channel = tokens.shape
+        # Convolution Output (B,Dim,Len) -> Transformer input (B,Dim,Len)
+        tokens = tokens.permute(0, 2, 1)
+        _bsz, seqlen, _channel = tokens.shape
         # h = self.tok_embeddings(tokens)
         freqs_cis = self.freqs_cis[ : seqlen]
         h = tokens
