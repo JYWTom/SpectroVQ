@@ -18,7 +18,7 @@ import warnings
 
 import torch
 
-COMPILE_MODES = ("none", "default", "max-autotune")
+from utils.sessions import COMPILE_MODES  # a session setting; re-exported for callers
 
 
 def python_headers_available() -> bool:
